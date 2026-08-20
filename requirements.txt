@@ -10,6 +10,6 @@ pandas==3.0.5
 numpy==2.5.2
 openpyxl==3.1.5
 
-# license_coverage.ipynb
+# main.ipynb
 matplotlib==3.11.1
 ipykernel==7.3.0

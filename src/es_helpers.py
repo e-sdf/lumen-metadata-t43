@@ -17,7 +17,7 @@ import requests
 DOCUMENTS_INDEX = "triple-documents-prod"
 
 # .env sits at the project root, one level above this package. Anchoring to
-# __file__ keeps it findable whether the caller is main.py, a notebook, or a
+# __file__ keeps it findable whether the caller is run_pipeline.py, a notebook, or a
 # script started from somewhere else entirely.
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENV_PATH = os.path.join(PROJECT_ROOT, ".env")
