@@ -1,0 +1,10 @@
+# Development extras, on top of the runtime dependencies.
+#   venv/bin/pip install -r requirements-dev.txt
+#
+# Only needed to execute license_coverage.ipynb headlessly (CI, a terminal, a
+# scripted refresh). Opening and running it in VS Code needs nothing from here.
+
+-r requirements.txt
+
+nbclient==0.11.0
+nbformat==5.11.1

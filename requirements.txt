@@ -1,0 +1,15 @@
+# Direct dependencies only - pip resolves the rest.
+#   python -m venv venv && venv/bin/pip install -r requirements.txt
+
+# Scraping and the metadata APIs (Crossref, OpenAlex, Handle, OAI-PMH, Elasticsearch)
+requests==2.34.2
+beautifulsoup4==4.15.0
+
+# Pipelines and the Excel reports in data/output
+pandas==3.0.5
+numpy==2.5.2
+openpyxl==3.1.5
+
+# license_coverage.ipynb
+matplotlib==3.11.1
+ipykernel==7.3.0
