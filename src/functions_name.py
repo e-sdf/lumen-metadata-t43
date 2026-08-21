@@ -427,6 +427,65 @@ def looks_like_a_name(value):
     return digits / len(text) <= 0.3
 
 
+def resolve_repository_ids(records, chunk_size=100):
+    """Numeric "names" that are not people at all, but a repository's own author id.
+
+    WEKO repositories (u-tokyo, niigata and a handful of others) publish their
+    internal author id as a second `dc:creator`, immediately after the creator it
+    belongs to. BASE harvests that flattened oai_dc view, so GoTriple mints a
+    profile per id. The repository's own richer jpcoar record for the same
+    document lists the creators and no ids at all:
+
+        jpcoar   creatorName: 増田, 康介
+        oai_dc   dc:creator : 増田, 康介 | 161278      <- 161278 is her id, not a person
+
+    The pairing survives into the documents index, where `author` keeps the
+    harvested order, so the owner is simply the entry before the id - no request
+    to the repository needed. Returns {profile_id: owner's name}, and only where
+    the entry before it really is a name.
+    """
+    from src.es_helpers import es_search
+
+    numeric = {str(r.get("id")): str(r.get("fullname") or "").strip()
+               for r in records if str(r.get("fullname") or "").strip().isdigit()}
+    if not numeric:
+        return {}
+
+    references = []
+    for record in records:
+        if str(record.get("id")) not in numeric:
+            continue
+        docs = record.get("author_of") or []
+        references.extend(str(d) for d in (docs if isinstance(docs, list) else [docs]))
+    references = list(dict.fromkeys(references))
+
+    owners = {}
+    for start in range(0, len(references), chunk_size):
+        try:
+            hits = es_search({
+                "size": chunk_size,
+                "query": {"terms": {"id": references[start:start + chunk_size]}},
+                "_source": ["id", "author"]
+            }, index=DOCUMENTS_INDEX)["hits"]["hits"]
+        except Exception:
+            continue  # a bad chunk should not sink the whole pass
+
+        for hit in hits:
+            authors = hit["_source"].get("author") or []
+            for position, author in enumerate(authors):
+                author_id = str(author.get("id"))
+                if author_id not in numeric or author_id in owners or position == 0:
+                    continue
+                # the id is only an id if the profile's own name is that number too
+                if str(author.get("fullname") or "").strip() != numeric[author_id]:
+                    continue
+                previous = authors[position - 1].get("fullname")
+                if looks_like_a_name(previous):
+                    owners[author_id] = str(previous).strip()
+
+    return owners
+
+
 def recover_names_from_documents(records, chunk_size=100):
     """Look each profile's `author_of` documents up in the documents index and
     take the name that document records for this author id.

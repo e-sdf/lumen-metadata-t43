@@ -8,7 +8,8 @@ import concurrent.futures
 from src.functions_license import fetch_gotriple_documents, fetch_elastic_documents, process_document
 from src.functions_name import (fetch_gotriple_authors, fetch_elastic_authors, process_author,
                                 resolve_author, cluster_authors, recover_names_from_documents, classify_name_problem,
-                                fetch_top_author_names, fetch_names_from_documents, best_name_form)
+                                fetch_top_author_names, fetch_names_from_documents, best_name_form,
+                                resolve_repository_ids)
 
 # Paths are anchored to the project root, so a run works from any working directory.
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -126,12 +127,13 @@ def _resolve_in_parallel(authors, label="Resolved"):
 def _recover_names(authors):
     """Fix broken names, whatever is wrong with them.
 
-    Three routes, cheapest first:
+    Four routes, cheapest first:
+      0. a bare number that is a repository's author id -> not a person at all
       1. an ORCID sitting inside the name -> ask ORCID for the canonical name
       2. the documents index -> the name a document records for this author id
       3. strip the junk (URLs, "orcid" tokens, stray punctuation) off what is left
 
-    Route 1 and 3 live in resolve_author(); route 2 is a single batched query.
+    Route 1 and 3 live in resolve_author(); routes 0 and 2 are batched queries.
     """
     print(f"Recovering names for {len(authors)} profiles...")
 
@@ -139,6 +141,24 @@ def _recover_names(authors):
         author["name_problem"] = classify_name_problem(author.get("fullname"))
     problems = collections.Counter(a["name_problem"] for a in authors)
     print("-> what is wrong with them:", dict(problems.most_common()))
+
+    # Route 0: settle the bare numbers that are repository ids before paying for
+    # any lookup. There is no name to recover for these - they are not people -
+    # so they are answered here and skipped by everything below.
+    settled = []
+    numeric = [a for a in authors if a["name_problem"] == "numeric"]
+    if numeric:
+        owners = resolve_repository_ids(numeric)
+        print(f"-> {len(owners)}/{len(numeric)} numeric names are a repository's own author id, "
+              "not a person")
+        for author in numeric:
+            if owner := owners.get(str(author.get("id"))):
+                author["name_source"] = "repository id"
+                author["belongs_to"] = owner
+                author["fullname_fix"] = author.get("fullname")  # unchanged: nothing to fix
+                author["id_fix"] = None
+                settled.append(author)
+        authors = [a for a in authors if a.get("name_source") != "repository id"]
 
     # Route 2, batched: only worth it where there is no ORCID to follow.
     without_orcid = [a for a in authors if a["name_problem"] in ("empty", "numeric", "no letters", "url instead of a name")]
@@ -150,7 +170,7 @@ def _recover_names(authors):
                 author["fullname"] = recovered
                 author["name_source"] = "documents index"
 
-    resolved = _resolve_in_parallel(authors, label="Name")
+    resolved = _resolve_in_parallel(authors, label="Name") + settled
 
     for author in resolved:
         if author.get("name_source"):
@@ -170,8 +190,12 @@ def _recover_names(authors):
     print("\n--- Name recovery by problem ---")
     for problem in sorted(problems):
         group = [a for a in resolved if a["name_problem"] == problem]
-        fixed = [a for a in group if a["name_source"] not in ("not recovered", "unchanged")]
-        print(f"     * {problem:24} {len(fixed):>4}/{len(group):<4} recovered")
+        fixed = [a for a in group if a["name_source"] not in
+                 ("not recovered", "unchanged", "repository id")]
+        ids = [a for a in group if a["name_source"] == "repository id"]
+        # a repository id is not a failed recovery: there was no name to recover
+        note = f"  ({len(ids)} are repository ids, not people)" if ids else ""
+        print(f"     * {problem:24} {len(fixed):>4}/{len(group):<4} recovered{note}")
 
     return resolved
 
