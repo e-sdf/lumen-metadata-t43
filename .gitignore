@@ -2,7 +2,7 @@
 .env
 .env.*
 !.env.example
-.pptx
+*.pptx
 
 
 # Elasticsearch scratchpads: queries.es carries the cluster host in its header,
