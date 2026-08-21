@@ -9,7 +9,7 @@ from src.functions_license import fetch_gotriple_documents, fetch_elastic_docume
 from src.functions_name import (fetch_gotriple_authors, fetch_elastic_authors, process_author,
                                 resolve_author, cluster_authors, recover_names_from_documents, classify_name_problem,
                                 fetch_top_author_names, fetch_names_from_documents, best_name_form,
-                                resolve_repository_ids)
+                                resolve_repository_ids, enrich_authors_from_dois)
 
 # Paths are anchored to the project root, so a run works from any working directory.
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -236,9 +236,26 @@ def _attach_document_evidence(authors):
     return authors
 
 
-def _disambiguate_clustered(authors):
-    """Resolve every record first, then cluster the whole set in one pass."""
+def _disambiguate_clustered(authors, enrich_from_dois=True):
+    """Resolve every record first, then cluster the whole set in one pass.
+
+    Between the two phases the profiles are asked about by DOI: the profiles
+    index carries neither an ORCID nor an organisation for most people, and both
+    are decisive here, so the papers themselves are the only place to get them.
+    Set enrich_from_dois=False to cluster on the index alone.
+    """
     resolved = _resolve_in_parallel(authors)
+
+    if enrich_from_dois:
+        print(f"\nAsking the documents' DOIs who wrote them...")
+        found = enrich_authors_from_dois(resolved)
+        print(f"-> {found['with a doi']}/{found['documents']} documents carry a DOI "
+              f"({found['distinct dois']} distinct)")
+        print(f"-> ORCID recovered for {found['orcid']} profiles, "
+              f"an organisation for {found['organization']}, "
+              f"co-authors for {found['with co-authors']}; "
+              f"{found['ambiguous']} lookups matched no single author and were dropped")
+
     print(f"\nClustering {len(resolved)} resolved records...")
     clustered = cluster_authors(resolved)
 

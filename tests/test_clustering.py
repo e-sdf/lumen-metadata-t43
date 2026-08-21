@@ -13,10 +13,11 @@ import sys
 from src.functions_name import cluster_authors, name_is_informative
 
 
-def profile(pid, name, topics=(), docs=(), orgs=(), orcid=None):
+def profile(pid, name, topics=(), docs=(), orgs=(), orcid=None, dois=(), co_authors=()):
     return {
         "id": pid, "fullname": name, "_resolved_name": name, "id_fix": orcid,
         "topic": list(topics), "author_of": list(docs), "current_organization": list(orgs),
+        "doi": list(dois), "co_authors": list(co_authors),
     }
 
 
@@ -58,6 +59,24 @@ FIXTURES = [
         [profile("a", "Wang, Y.", orgs=["Tsinghua"], docs=["d1"]),
          profile("b", "Wang, Y.", orgs=["Tsinghua"], docs=["d2"])],
         {frozenset({"a", "b"})},
+    ),
+    (
+        "same paper under two harvested ids, joined by the DOI -> merge",
+        [profile("a", "Wang, Y.", docs=["ftinsu:oai:HAL:hal-1"], dois=["10.1000/xyz"]),
+         profile("b", "Wang, Y.", docs=["ftceafr:oai:HAL:hal-1"], dois=["10.1000/xyz"])],
+        {frozenset({"a", "b"})},
+    ),
+    (
+        "two co-authors in common -> merge",
+        [profile("a", "Wang, Y.", docs=["d1"], co_authors=["xu|x", "wei|f", "feng|x"]),
+         profile("b", "Wang, Y.", docs=["d2"], co_authors=["xu|x", "wei|f", "zou|p"])],
+        {frozenset({"a", "b"})},
+    ),
+    (
+        "one co-author in common is coincidence -> apart",
+        [profile("a", "Wang, Y.", docs=["d1"], co_authors=["chen|j", "li|x"]),
+         profile("b", "Wang, Y.", docs=["d2"], co_authors=["chen|j", "zhu|m"])],
+        {frozenset({"a"}), frozenset({"b"})},
     ),
     (
         "distinctive name plus topic overlap -> merge",

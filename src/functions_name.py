@@ -555,6 +555,231 @@ def resolve_author(record):
     return record
 
 
+# Above this many authors a paper says nothing about who anyone is: two different
+# Y. Wangs inside the same 800-author collaboration share every co-author on it.
+CO_AUTHOR_LIMIT = 25
+
+
+def fetch_document_context(document_ids, chunk_size=100):
+    """What the documents index knows about each document: its DOI and everyone
+    credited on it.
+
+    The DOI is the document's real identity - the same work is harvested from
+    several repositories and lands in GoTriple under a different id each time
+    (one paper as ftinsu:…, ftceafr:… and ftuniversailles:…), so two profiles on
+    the same paper can look unrelated. The author list is the other half: who a
+    person publishes *with* is the strongest evidence available here that two
+    records are the same person, and it costs nothing extra to read.
+    """
+    from src.es_helpers import es_search
+
+    ids = [str(d) for d in dict.fromkeys(document_ids) if str(d).strip()]
+    context = {}
+    for start in range(0, len(ids), chunk_size):
+        try:
+            hits = es_search({"size": chunk_size,
+                              "query": {"terms": {"id": ids[start:start + chunk_size]}},
+                              "_source": ["id", "doi", "author", "date_published"]},
+                             index=DOCUMENTS_INDEX)["hits"]["hits"]
+        except Exception:
+            continue  # a bad chunk should not sink the pass
+        for hit in hits:
+            source = hit["_source"]
+            context[source["id"]] = {
+                "doi": [str(d).strip().lower() for d in (source.get("doi") or []) if str(d).strip()],
+                "authors": [str(a.get("fullname")) for a in (source.get("author") or [])
+                            if looks_like_a_name(a.get("fullname"))],
+                "date": str(source.get("date_published") or ""),
+            }
+    return context
+
+
+def fetch_document_dois(document_ids, chunk_size=100):
+    """Just the DOIs, for callers that do not need the rest of the context."""
+    return {document: found["doi"]
+            for document, found in fetch_document_context(document_ids, chunk_size).items()
+            if found["doi"]}
+
+
+def co_author_keys(name, authors):
+    """The co-authors of one paper, as "family|initial" keys.
+
+    Keyed loosely so "Xu, X. H." and "X. Xu" are the same person, and never
+    including anyone who shares the profile's own family name: two unrelated
+    Y. Wangs must not be joined by the presence of a third Wang.
+    """
+    family = _name_key(name)[0]
+    keys = set()
+    for author in authors:
+        other_family, other_given = _name_key(author)
+        if not other_family or other_family == family:
+            continue
+        keys.add(f"{other_family}|{other_given[:1]}")
+    return keys
+
+
+_doi_authors_cache = {}
+_doi_authors_lock = threading.Lock()
+
+
+def authors_from_doi(doi, timeout=20):
+    """Who a DOI says wrote the paper: name, ORCID and affiliations, per author.
+
+    OpenAlex first - it carries an ORCID for nearly every work and an institution
+    for almost all of them - with Crossref as the fallback. Cached, because one
+    DOI is shared by every profile attached to that paper.
+    """
+    from src.rate_limit import polite_get
+
+    key = str(doi).strip().lower()
+    with _doi_authors_lock:
+        if key in _doi_authors_cache:
+            return _doi_authors_cache[key]
+
+    people = []
+    try:
+        response = polite_get(enrichment_session, f"https://api.openalex.org/works/https://doi.org/{key}",
+                              timeout=timeout)
+        if response is not None and response.status_code == 200:
+            for authorship in response.json().get("authorships", []) or []:
+                author = authorship.get("author") or {}
+                people.append({
+                    "name": str(author.get("display_name") or "").strip(),
+                    "orcid": (author.get("orcid") or "").rsplit("/", 1)[-1] or None,
+                    "organizations": [str(i.get("display_name")) for i in (authorship.get("institutions") or [])
+                                      if i.get("display_name")],
+                })
+    except Exception:
+        people = []
+
+    if not people:
+        try:
+            response = polite_get(enrichment_session, f"https://api.crossref.org/works/{key}", timeout=timeout)
+            if response is not None and response.status_code == 200:
+                for author in response.json().get("message", {}).get("author", []) or []:
+                    name = f"{author.get('given', '')} {author.get('family', '')}".strip()
+                    if not name:
+                        continue
+                    people.append({
+                        "name": name,
+                        "orcid": (author.get("ORCID") or "").rsplit("/", 1)[-1] or None,
+                        "organizations": [str(a.get("name")) for a in (author.get("affiliation") or [])
+                                          if a.get("name")],
+                    })
+        except Exception:
+            pass
+
+    with _doi_authors_lock:
+        _doi_authors_cache[key] = people
+    return people
+
+
+def _name_key(value):
+    """(family, given) lowercased, whichever way round the name was written."""
+    text = re.sub(r"[.·]", " ", str(value or "")).strip()
+    if "," in text:
+        family, _, given = text.partition(",")
+    else:
+        parts = [p for p in text.split() if p]
+        if len(parts) < 2:
+            return text.lower(), ""
+        family, given = parts[-1], " ".join(parts[:-1])
+    return family.strip().lower(), given.strip().lower()
+
+
+def match_author_in_work(name, people):
+    """The one author of a work this profile can be, or None.
+
+    Same family name, and given names that do not contradict - "Y." matches
+    "Yang" but "Yang" does not match "Yun". **Only a unique match counts**: these
+    papers routinely carry several Wangs, and picking one of them would invent
+    evidence rather than find it.
+    """
+    family, given = _name_key(name)
+    if not family:
+        return None
+
+    candidates = []
+    for person in people:
+        other_family, other_given = _name_key(person.get("name"))
+        if other_family != family:
+            continue
+        if given and other_given:
+            short, long_ = sorted((given, other_given), key=len)
+            initial_only = len(short.replace(" ", "")) <= 1 or short.endswith(".")
+            if not (long_.startswith(short) if not initial_only else long_.startswith(short[0])):
+                continue
+        candidates.append(person)
+
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def enrich_authors_from_dois(records, max_workers=8):
+    """Ask each profile's documents, by DOI, who wrote them - and keep what comes
+    back only where it can belong to exactly one author of that paper.
+
+    Two things come out of it, both of which clustering already knows how to use:
+    an ORCID (proof of identity, and proof of *non*-identity between two profiles
+    holding different ones) and an affiliation (a shared organisation is a merge
+    rule on its own). Sets `id_fix`, `current_organization` and `doi` on the
+    records in place, and returns a summary of what was found.
+    """
+    import concurrent.futures
+
+    references = []
+    for record in records:
+        docs = record.get("author_of") or []
+        references.extend(str(d) for d in (docs if isinstance(docs, list) else [docs]))
+
+    context = fetch_document_context(references)
+    for record in records:
+        docs = record.get("author_of") or []
+        docs = docs if isinstance(docs, list) else [docs]
+        found = [context.get(str(d), {}) for d in docs]
+        record["doi"] = sorted({doi for entry in found for doi in entry.get("doi", [])})
+        # Who this profile published with, from the documents index alone. Papers
+        # with a cast of hundreds are skipped: everyone on one shares everyone else.
+        record["co_authors"] = sorted({
+            key for entry in found if 0 < len(entry.get("authors", [])) <= CO_AUTHOR_LIMIT
+            for key in co_author_keys(record.get("_resolved_name") or record.get("fullname") or "",
+                                      entry["authors"])})
+
+    distinct = sorted({doi for record in records for doi in record["doi"]})
+    summary = {"documents": len(references),
+               "with a doi": sum(1 for entry in context.values() if entry["doi"]),
+               "distinct dois": len(distinct),
+               "with co-authors": sum(1 for record in records if record["co_authors"]),
+               "orcid": 0, "organization": 0, "ambiguous": 0}
+    if not distinct:
+        return summary
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        list(executor.map(authors_from_doi, distinct))  # fills the cache, politely and in parallel
+
+    for record in records:
+        name = record.get("_resolved_name") or record.get("fullname") or ""
+        organizations = set(record.get("current_organization") or [])
+        for doi in record["doi"]:
+            people = authors_from_doi(doi)
+            if not people:
+                continue
+            match = match_author_in_work(name, people)
+            if match is None:
+                summary["ambiguous"] += 1
+                continue
+            if match["orcid"] and not record.get("id_fix"):
+                record["id_fix"] = match["orcid"]
+                record["orcid_source"] = f"doi:{doi}"
+                summary["orcid"] += 1
+            if match["organizations"]:
+                organizations |= set(match["organizations"])
+        if organizations != set(record.get("current_organization") or []):
+            record["current_organization"] = sorted(organizations)
+            summary["organization"] += 1
+
+    return summary
+
+
 def cluster_authors(records):
     """PHASE 2 - decide which resolved records are the same person.
 
@@ -583,7 +808,14 @@ def cluster_authors(records):
             # Exact shared documents: two profiles on the same paper with the
             # same name are the same person. Cheaper and far more precise than
             # the domain overlap, which only says "same repository".
-            "documents": {str(d) for d in docs_list},
+            #
+            # The DOI counts as the same kind of evidence, and reaches further:
+            # one paper is harvested from several repositories and lands under a
+            # different GoTriple id each time, so co-authors on it can look
+            # unrelated until the DOI puts the copies back together.
+            "documents": {str(d) for d in docs_list}
+                         | {f"doi:{d}" for d in (record.get("doi") or [])},
+            "co_authors": set(record.get("co_authors") or []),
             "informative": name_is_informative(record.get("_resolved_name") or record.get("fullname", "")),
         })
 
@@ -622,9 +854,18 @@ def cluster_authors(records):
             topic_overlap = bool(a["topics"] & b["topics"])
             domain_overlap = bool(a["domains"] & b["domains"])
 
-            # Co-authorship on the same document, or a shared organisation, is
-            # proof enough on its own - even for a name as common as "Wang, Y.".
+            # The same document, or a shared organisation, is proof enough on its
+            # own - even for a name as common as "Wang, Y.".
             if shared_document or org_overlap:
+                union(i, j)
+                continue
+
+            # Two papers by different people who happen to share a name will not
+            # share a circle of collaborators; two papers by the same person
+            # usually do. One shared co-author can be coincidence (a common
+            # surname, a large group), so two are required, and papers with a
+            # cast of hundreds were excluded when the sets were built.
+            if len(a["co_authors"] & b["co_authors"]) >= 2:
                 union(i, j)
                 continue
 
@@ -723,8 +964,18 @@ def process_author(record):
     with registry_lock:
         for registered in AUTHOR_REGISTRY:
             # --- SHORTCUT RULE: Exact ORCID Match ---
+            # This used to `break` with an empty body, which left is_aka False and
+            # sent the record on to be registered as a brand new author - the
+            # strongest evidence there is, silently discarded. Two records with the
+            # same ORCID are the same person, so the merge happens here.
             if extracted_orcid and registered.get('orcid') == extracted_orcid:
-                # ... [existing shortcut code] ...
+                is_aka = True
+                aka_primary_name = registered['primary_name']
+                registered['topics'].update(topics)
+                registered['organizations'].update(organizations)
+                registered['domains'].update(document_domains)
+                registered['full_variants'].update(full_vars)
+                registered['initial_variants'].update(init_vars)
                 break
                 
             # --- NEW: HARD BLOCKER RULE ---

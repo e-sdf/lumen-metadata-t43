@@ -2,6 +2,8 @@
 .env
 .env.*
 !.env.example
+.pptx
+
 
 # Elasticsearch scratchpads: queries.es carries the cluster host in its header,
 # and the VS Code Elastic extension stores the user:password there too.
@@ -10,6 +12,7 @@
 venv/
 .venv/
 env/
+queries_es/
 
 # Python bytecode and packaging leftovers
 __pycache__/
