@@ -113,57 +113,74 @@ def extract_orcid(text):
         return f"{match.group(1).zfill(4)}-{match.group(2).zfill(4)}-{match.group(3).zfill(4)}-{match.group(4)}"
     return None
 
+def _author_in_source_record(known_name, people):
+    """The one author of a source record this profile can be, or None.
+
+    Records with a cast of hundreds are refused outright. A 2,273-author CMS
+    paper lists dozens of people sharing any given initial, so its creator list
+    cannot say which of them a profile is - the same reason CO_AUTHOR_LIMIT
+    exists on the co-author side. Beyond that the rule is
+    match_author_in_work()'s: same family name, given names that do not
+    contradict, and a unique match or nothing.
+    """
+    people = [person for person in people if str(person.get("name") or "").strip()]
+    if not people or len(people) > CO_AUTHOR_LIMIT:
+        return None
+    return match_author_in_work(known_name, people)
+
+
 def enrich_author_data_from_documents(docs, known_name=""):
     """
-    Takes a list of document strings, detects their type, and queries 
+    Takes a list of document strings, detects their type, and queries
     their source APIs to find an ORCID or a better full name.
+
+    Each source is reduced to the same {name, orcid} shape and handed to
+    _author_in_source_record(), so one matching rule covers all three. Matching
+    on a loose substring of the name is what once turned a "Wang, Y." profile
+    into "Pakhotin, Y.": "Wang, Y." splits to the initial "y.", which is a
+    substring of 39 of that paper's 2,273 creators, and the last one seen won.
     """
     found_orcid = None
     found_name = None
-    
+
     if not isinstance(docs, list):
         return found_orcid, found_name
 
     for doc in docs:
         doc_str = str(doc)
-        
+        match = None
+
         # 1. DOAJ Articles
         if "doaj.org_article" in doc_str:
-            match = re.search(r'doaj\.org_article[:_]([a-zA-Z0-9]+)', doc_str)
-            if match:
-                doaj_id = match.group(1)
+            article = re.search(r'doaj\.org_article[:_]([a-zA-Z0-9]+)', doc_str)
+            if article:
+                doaj_id = article.group(1)
                 try:
                     res = enrichment_session.get(f"https://doaj.org/api/v3/articles/{doaj_id}", timeout=3)
                     if res.status_code == 200:
-                        authors = res.json().get("bibjson", {}).get("author", [])
-                        for author in authors:
-                            # Fuzzy check to make sure we are grabbing the right author from the list
-                            if known_name.lower().split()[-1] in author.get("name", "").lower():
-                                if author.get("orcid_id"):
-                                    found_orcid = author["orcid_id"].replace("https://orcid.org/", "")
-                                found_name = author.get("name")
+                        match = _author_in_source_record(known_name, [
+                            {"name": author.get("name"),
+                             "orcid": (author.get("orcid_id") or "").replace("https://orcid.org/", "") or None}
+                            for author in res.json().get("bibjson", {}).get("author", []) or []])
                 except:
                     pass
-                    
+
         # 2. Handles and DOIs (e.g., 10670_1.stl7fb -> 10670/1.stl7fb)
         elif doc_str.startswith("10"):
             clean_id = doc_str.replace("_", "/", 1) # Replace the first underscore with a slash
-            
+
             # If it has a dot, it's a DOI -> Query Crossref
             if clean_id.startswith("10."):
                 try:
                     res = enrichment_session.get(f"https://api.crossref.org/works/{clean_id}", timeout=3)
                     if res.status_code == 200:
-                        authors = res.json().get("message", {}).get("author", [])
-                        for author in authors:
-                            author_last = author.get("family", "").lower()
-                            if author_last and author_last in known_name.lower():
-                                if author.get("ORCID"):
-                                    found_orcid = author["ORCID"].replace("http://orcid.org/", "").replace("https://orcid.org/", "")
-                                found_name = f"{author.get('given', '')} {author.get('family', '')}".strip()
+                        match = _author_in_source_record(known_name, [
+                            {"name": f"{author.get('given', '')} {author.get('family', '')}".strip(),
+                             "orcid": (author.get("ORCID") or "").rsplit("/", 1)[-1] or None}
+                            for author in res.json().get("message", {}).get("author", []) or []])
                 except:
                     pass
-                    
+
         # 3. Standard OAI-PMH Repositories (e.g., ftunivzadar:oai:repozitorij...)
         elif ":oai:" in doc_str:
             try:
@@ -172,11 +189,11 @@ def enrich_author_data_from_documents(docs, known_name=""):
                 if len(parts) == 2:
                     domain = parts[0]
                     doc_id = parts[1].replace("_", "/", 1)
-                    
+
                     # Try standard OAI endpoint
                     oai_url = f"https://{domain}/oai/request?verb=GetRecord&metadataPrefix=oai_dc&identifier=oai:{domain}:{doc_id}"
                     res = enrichment_session.get(oai_url, timeout=3)
-                    
+
                     # If the repository uses modern DSpace (like CORA), it hides the API under /server/
                     if "<ds-app>" in res.text or res.status_code == 404:
                         oai_url = f"https://{domain}/server/oai/request?verb=GetRecord&metadataPrefix=oai_dc&identifier=oai:{domain}:{doc_id}"
@@ -184,14 +201,18 @@ def enrich_author_data_from_documents(docs, known_name=""):
 
                     if res.status_code == 200 and "<?xml" in res.text:
                         root = ET.fromstring(res.content)
-                        # Find creators in the Dublin Core XML
-                        for creator in root.findall(".//{http://purl.org/dc/elements/1.1/}creator"):
-                            if creator.text and known_name.lower().split()[-1] in creator.text.lower():
-                                found_name = creator.text
-                                # Note: basic oai_dc rarely contains ORCIDs natively, but we get a pristine name format
+                        # Note: basic oai_dc rarely contains ORCIDs natively, but we get a pristine name format
+                        match = _author_in_source_record(known_name, [
+                            {"name": creator.text, "orcid": None}
+                            for creator in root.findall(".//{http://purl.org/dc/elements/1.1/}creator")])
             except:
                 pass
-                
+
+        if match:
+            found_name = match["name"]
+            if match.get("orcid"):
+                found_orcid = match["orcid"]
+
         # Break early if we successfully found an ORCID to save API calls
         if found_orcid:
             break
@@ -525,6 +546,39 @@ def recover_names_from_documents(records, chunk_size=100):
     return recovered
 
 
+def _is_same_person(original, enriched):
+    """May `enriched` replace `original`, or would that rename the person?
+
+    Enrichment is allowed to *complete* a name ("Wang, Y." -> "Wang, Yun"), never
+    to swap it for somebody else's. A profile whose name was already a name and
+    comes back with a different family name is a mismatch in the source record,
+    and keeping it is worse than keeping the initials: the wrong name then
+    travels on to enrich_authors_from_dois(), where a *rare* wrong name passes
+    the unique-match test that the true common one would have failed - which is
+    how four "Wang, Y." profiles ended up holding Yuri Gershtein's ORCID.
+
+    Names that were junk or blank have nothing to protect, so recovery from the
+    document is exactly what should happen there.
+    """
+    if not looks_like_a_name(original):
+        return True
+    return _name_key(original)[0] == _name_key(enriched)[0]
+
+
+def trusted_name(record):
+    """The name to match a record against a paper's author list.
+
+    Phase 1's `_resolved_name` where it is a refinement of the real name, and
+    the untouched `fullname` where it is a rename - so no invented name can be
+    laundered into an ORCID no matter which pass produced it.
+    """
+    original = str(record.get("fullname") or "")
+    resolved = str(record.get("_resolved_name") or "")
+    if resolved and _is_same_person(original, resolved):
+        return resolved
+    return original or resolved
+
+
 def resolve_author(record):
     """PHASE 1 - name and ORCID recovery for ONE record, in isolation.
 
@@ -542,7 +596,7 @@ def resolve_author(record):
         found_orcid, found_name = enrich_author_data_from_documents(docs_list, original_text)
         if found_orcid and (validated := extract_orcid(found_orcid)):
             extracted_orcid = validated
-        if found_name:
+        if found_name and _is_same_person(original_text, found_name):
             enriched_name = found_name
 
     corrected_name = fetch_orcid_name(extracted_orcid, enriched_name or original_text)
@@ -741,8 +795,7 @@ def enrich_authors_from_dois(records, max_workers=8):
         # with a cast of hundreds are skipped: everyone on one shares everyone else.
         record["co_authors"] = sorted({
             key for entry in found if 0 < len(entry.get("authors", [])) <= CO_AUTHOR_LIMIT
-            for key in co_author_keys(record.get("_resolved_name") or record.get("fullname") or "",
-                                      entry["authors"])})
+            for key in co_author_keys(trusted_name(record), entry["authors"])})
 
     distinct = sorted({doi for record in records for doi in record["doi"]})
     summary = {"documents": len(references),
@@ -757,7 +810,7 @@ def enrich_authors_from_dois(records, max_workers=8):
         list(executor.map(authors_from_doi, distinct))  # fills the cache, politely and in parallel
 
     for record in records:
-        name = record.get("_resolved_name") or record.get("fullname") or ""
+        name = trusted_name(record)
         organizations = set(record.get("current_organization") or [])
         for doi in record["doi"]:
             people = authors_from_doi(doi)
@@ -788,7 +841,7 @@ def cluster_authors(records):
     by rule instead of by arrival order. Pure - no network, no shared state.
     """
     # Sort so the outcome cannot depend on the order futures happened to complete.
-    ordered = sorted(records, key=lambda r: (str(r.get("_resolved_name") or ""), str(r.get("id") or "")))
+    ordered = sorted(records, key=lambda r: (trusted_name(r), str(r.get("id") or "")))
 
     contexts = []
     for record in ordered:
@@ -796,7 +849,7 @@ def cluster_authors(records):
         docs_list = docs if isinstance(docs, list) else [docs]
         topics = record.get("topic") or []
         orgs = record.get("current_organization") or []
-        full_vars, init_vars = generate_name_variants(record.get("_resolved_name") or record.get("fullname", ""))
+        full_vars, init_vars = generate_name_variants(trusted_name(record))
         contexts.append({
             "record": record,
             "orcid": record.get("id_fix"),
@@ -816,7 +869,7 @@ def cluster_authors(records):
             "documents": {str(d) for d in docs_list}
                          | {f"doi:{d}" for d in (record.get("doi") or [])},
             "co_authors": set(record.get("co_authors") or []),
-            "informative": name_is_informative(record.get("_resolved_name") or record.get("fullname", "")),
+            "informative": name_is_informative(trusted_name(record)),
         })
 
     parent = list(range(len(contexts)))
@@ -888,7 +941,7 @@ def cluster_authors(records):
             record = context["record"]
             is_master = context is master
             record["is_aka"] = "No" if is_master else "Yes"
-            record["aka_of"] = "" if is_master else str(master["record"].get("_resolved_name") or "")
+            record["aka_of"] = "" if is_master else trusted_name(master["record"])
             # `aka_of` is only a name, and two unrelated people can share one.
             # The master's id identifies the cluster unambiguously.
             record["cluster_id"] = str(master["record"].get("id") or "")
@@ -907,7 +960,7 @@ def _pick_master(members):
     complete name, then the id - never 'whoever arrived first'."""
     return min(members, key=lambda c: (
         0 if c["orcid"] else 1,
-        -len(str(c["record"].get("_resolved_name") or "")),
+        -len(trusted_name(c["record"])),
         str(c["record"].get("id") or ""),
     ))
 
@@ -931,9 +984,10 @@ def process_author(record):
             validated_orcid = extract_orcid(found_orcid)
             if validated_orcid:
                 extracted_orcid = validated_orcid
-        if found_name:
+        # Enrichment may complete a name, never swap it for another person's.
+        if found_name and _is_same_person(original_text, found_name):
             enriched_name = found_name
-            
+
     # Fallback to the original ORCID logic if the documents didn't provide one
     text_to_query = enriched_name if enriched_name else original_text
     corrected_name = fetch_orcid_name(extracted_orcid, text_to_query)
