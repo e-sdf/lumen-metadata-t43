@@ -6,6 +6,11 @@ from urllib.parse import urlparse
 import requests
 from bs4 import BeautifulSoup
 
+from src.functions_license_match import (
+    apply_original_license,
+    classify_original_license,
+    metadata_has_cc,
+)
 from src.rate_limit import USER_AGENT, CONTACT_EMAIL, polite_get, polite_head
 
 # Global session to maintain connection pooling
@@ -278,11 +283,7 @@ def find_possible_license(url, publisher_name, original_license):
     if not url_str.startswith('http'):
         return "[unknown, no valid URL provided]"
 
-    has_cc_in_metadata = False
-    if isinstance(original_license, list):
-        has_cc_in_metadata = any('creative_commons' in str(l).lower() for l in original_license)
-    else:
-        has_cc_in_metadata = 'creative_commons' in str(original_license).lower()
+    has_cc_in_metadata = metadata_has_cc(original_license)
 
     if publisher_name and any(oa_pub in str(publisher_name).lower() for oa_pub in KNOWN_OA_PUBLISHERS):
         return f"Open Access (Publisher: {publisher_name})"
@@ -348,31 +349,74 @@ def find_possible_license(url, publisher_name, original_license):
     except Exception:
         return "[unknown, connection failed]"
 
-def process_document(doc):
+def process_document(doc, scrape=True):
+    """Classify `original_license` first; scrape only what is still unresolved.
+
+    scrape=False is the local step (minutes, no HTTP). scrape=True is step 1:
+    page / Crossref / OAI, and only when original_license did not already yield
+    a GoTriple `lic_*` code. An OA badge or HAL authorisation is access, not a
+    recovered licence.
+    """
     page_url = doc.get("main_entity_of_page")
     current_license = doc.get("license")
+    classified = apply_original_license(doc)
 
-    if is_unresolved_license(current_license):
-        result = find_possible_license(page_url, doc.get("publisher"), current_license)
+    if not is_unresolved_license(current_license):
+        doc["scrapped_license"] = "Already classified"
+        return doc
 
-        # Landing pages behind Cloudflare or an institutional block (403), and
-        # pages with nothing useful in them, can still be resolved through the
-        # metadata APIs when the index knows a DOI for the document.
-        if str(result).startswith("[unknown"):
-            if dois := extract_dois(doc):
-                if licence := fetch_license_by_doi(dois):
-                    result = licence
+    if classified["license_fix"]:
+        doc["scrapped_license"] = classified["spdx"] or classified["license_fix"]
+        return doc
 
-        # Repository handles with no DOI: the OAI-PMH endpoint usually answers
-        # even when the landing page blocks us.
-        if str(result).startswith("[unknown"):
-            if licence := fetch_oai_rights(page_url):
+    if not scrape:
+        if classified["kind"] == "access":
+            access = classified["conditions_of_access_fix"] or "openAccess"
+            doc["scrapped_license"] = f"[access: {access}, not a licence]"
+        elif classified["kind"] in ("repository", "copyright"):
+            doc["scrapped_license"] = f"[{classified['kind']}, not a licence code]"
+        elif classified["kind"] == "unmapped":
+            doc["scrapped_license"] = "[unmapped original_license]"
+        else:
+            doc["scrapped_license"] = "[no original_license]"
+        return doc
+
+    result = find_possible_license(page_url, doc.get("publisher"), doc.get("original_license"))
+
+    # Landing pages behind Cloudflare or an institutional block (403), and
+    # pages with nothing useful in them, can still be resolved through the
+    # metadata APIs when the index knows a DOI for the document.
+    if str(result).startswith("[unknown"):
+        if dois := extract_dois(doc):
+            if licence := fetch_license_by_doi(dois):
                 result = licence
 
-        doc["scrapped_license"] = format_cc_license(result)
-    else:
-        doc["scrapped_license"] = "Already classified"
+    # Repository handles with no DOI: the OAI-PMH endpoint usually answers
+    # even when the landing page blocks us.
+    if str(result).startswith("[unknown"):
+        if licence := fetch_oai_rights(page_url):
+            result = licence
 
+    if not str(result).startswith("[unknown"):
+        scraped = classify_original_license(result)
+        if scraped["license_fix"]:
+            doc["license_fix"] = scraped["license_fix"]
+            doc["spdx"] = scraped["spdx"] or ""
+            doc["license_kind"] = scraped["kind"]
+            doc["license_source"] = "scrape"
+            doc["license_matched_from"] = scraped["matched_from"]
+            if scraped["conditions_of_access_fix"] and not doc.get("conditions_of_access_fix"):
+                doc["conditions_of_access_fix"] = scraped["conditions_of_access_fix"]
+        elif scraped["kind"] == "access":
+            doc["license_kind"] = "access"
+            doc["license_source"] = "scrape (access, not a licence)"
+            if scraped["conditions_of_access_fix"]:
+                doc["conditions_of_access_fix"] = scraped["conditions_of_access_fix"]
+        elif scraped["kind"] in ("repository", "copyright"):
+            doc["license_kind"] = scraped["kind"]
+            doc["license_source"] = f"scrape ({scraped['kind']}, not a licence)"
+
+    doc["scrapped_license"] = format_cc_license(result)
     return doc
 
 def parse_size(size):
@@ -389,26 +433,44 @@ def parse_size(size):
     return int(text)
 
 
-def count_elastic_documents(license_filter="unresolved", index=ELASTIC_INDEX):
+def count_elastic_documents(license_filter="unresolved", original_license="any",
+                            index=ELASTIC_INDEX):
     """How many documents a filter matches, before committing to fetching them."""
     from src.es_helpers import es_search
     return es_search({"size": 0, "track_total_hits": True,
-                      "query": build_license_query(license_filter)},
+                      "query": build_license_query(license_filter,
+                                                   original_license=original_license)},
                      index=index, timeout=180)["hits"]["total"]["value"]
 
 
-def build_license_query(license_filter="unresolved"):
+def _has_original_license_clause():
+    """A non-empty original_license. Empty string is treated as absent.
+
+    `exists` is not enough on its own: harvest writes "" on some records, and
+    Notion's empty case is missing-or-[]-or-"".
+    """
+    return {
+        "bool": {
+            "must": [{"exists": {"field": "original_license"}}],
+            "must_not": [{"term": {"original_license": ""}}],
+        }
+    }
+
+
+def build_license_query(license_filter="unresolved", original_license="any"):
     """Translate a license filter into an Elasticsearch query.
 
     "unresolved" selects the whole no-usable-license group: any of
     "other" / "undefined" / "" in the array, plus the 167 documents where the
     field is absent entirely. Any other value is matched literally.
+
+    original_license: "any" | "present" | "absent". "present" is the local
+    matching population (step 0). "absent" is the HTTP-only remainder (step 1).
     """
     if license_filter in (None, "any", "all"):
-        return {"match_all": {}}
-
-    if license_filter in UNRESOLVED_FILTER_ALIASES:
-        return {
+        base = {"match_all": {}}
+    elif license_filter in UNRESOLVED_FILTER_ALIASES:
+        base = {
             "bool": {
                 "should": [
                     {"terms": {"license": UNRESOLVED_LICENSE_VALUES}},
@@ -417,11 +479,21 @@ def build_license_query(license_filter="unresolved"):
                 "minimum_should_match": 1
             }
         }
+    else:
+        base = {"term": {"license": license_filter}}
 
-    return {"term": {"license": license_filter}}
+    if original_license in (None, "any", "all"):
+        return base
+    if original_license == "present":
+        return {"bool": {"must": [base, _has_original_license_clause()]}}
+    if original_license == "absent":
+        return {"bool": {"must": [base], "must_not": [_has_original_license_clause()]}}
+    raise ValueError(f"Unknown original_license filter '{original_license}'")
 
 
-def fetch_elastic_documents(size="1000", license_filter="unresolved", index=ELASTIC_INDEX):
+def fetch_elastic_documents(size="1000", license_filter="unresolved",
+                            original_license="any", index=ELASTIC_INDEX,
+                            source_fields=None):
     """Fetch documents straight from Elasticsearch instead of the GoTriple REST API.
 
     Pages with `search_after` on the `id` keyword field, so batches larger than
@@ -439,9 +511,11 @@ def fetch_elastic_documents(size="1000", license_filter="unresolved", index=ELAS
     while target is None or len(documents) < target:
         body = {
             "size": page_size if target is None else min(page_size, target - len(documents)),
-            "query": build_license_query(license_filter),
+            "query": build_license_query(license_filter, original_license=original_license),
             "sort": [{"id": "asc"}]
         }
+        if source_fields:
+            body["_source"] = source_fields
         if search_after:
             body["search_after"] = search_after
 

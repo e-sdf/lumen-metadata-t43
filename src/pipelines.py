@@ -1,11 +1,17 @@
 import collections
 import os
+from functools import partial
 import numpy as np
 import pandas as pd
 import concurrent.futures
 
 # Import helper functions from your separated files
-from src.functions_license import fetch_gotriple_documents, fetch_elastic_documents, process_document
+from src.functions_license import (
+    fetch_gotriple_documents,
+    fetch_elastic_documents,
+    process_document,
+)
+from src.functions_doi import fetch_elastic_doi_documents, recover_doi, classify_doi_problem
 from src.functions_name import (fetch_gotriple_authors, fetch_elastic_authors, process_author,
                                 resolve_author, cluster_authors, recover_names_from_documents, classify_name_problem,
                                 fetch_top_author_names, fetch_names_from_documents, best_name_form,
@@ -24,18 +30,36 @@ NAME_REPAIR_TASKS = {
     "broken_names": ("malformed", "all broken names (empty, ORCID inside, URLs, numeric)"),
 }
 
-def run_license_pipeline(num_docs:str="1000", max_workers:int=8, source:str="gotriple", license_filter:str="unresolved"):
-    """Scrape licenses for documents that are missing one.
+LICENSE_MATCH_FIELDS = [
+    "id", "provider", "license", "original_license", "publisher",
+    "main_entity_of_page", "doi", "headline",
+]
+
+
+def run_license_pipeline(num_docs:str="1000", max_workers:int=8, source:str="gotriple",
+                         license_filter:str="unresolved", scrape:bool=True,
+                         original_license:str="any"):
+    """Recover licenses for documents that are missing one.
+
+    Match `original_license` first (local, no HTTP). Scrape the landing page
+    only when that match did not yield a `lic_*` code — unless scrape=False,
+    which is the local-only step.
 
     source: "gotriple" reads through the public REST API (capped at one page),
             "elastic"  queries the production index directly and pages with
                        search_after, so batches beyond 10,000 work.
+    original_license: "any" | "present" | "absent" (Elasticsearch only).
     """
     print("\n--- STARTING DOCUMENT LICENSE PIPELINE ---")
-    print(f"Source: {source} | filter: license={license_filter} | requested: {num_docs}")
+    print(f"Source: {source} | filter: license={license_filter} "
+          f"| original_license={original_license} | scrape={scrape} | requested: {num_docs}")
 
     if source == "elastic":
-        docs = fetch_elastic_documents(size=num_docs, license_filter=license_filter)
+        docs = fetch_elastic_documents(
+            size=num_docs, license_filter=license_filter,
+            original_license=original_license,
+            source_fields=LICENSE_MATCH_FIELDS if not scrape else None,
+        )
     elif source == "gotriple":
         docs = fetch_gotriple_documents(size=num_docs, license_filter=license_filter)
     else:
@@ -47,47 +71,96 @@ def run_license_pipeline(num_docs:str="1000", max_workers:int=8, source:str="got
 
     print(f"Processing {len(docs)} documents concurrently...")
     processed_docs = []
+    worker = partial(process_document, scrape=scrape)
 
     # Threads are throttled per host in rate_limit.py, so this only bounds how
-    # many *different* hosts we talk to at once.
+    # many *different* hosts we talk to at once. scrape=False never opens a socket.
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        for i, future in enumerate(concurrent.futures.as_completed({executor.submit(process_document, d): d for d in docs}), 1):
+        for i, future in enumerate(concurrent.futures.as_completed(
+                {executor.submit(worker, d): d for d in docs}), 1):
             res = future.result()
             processed_docs.append(res)
             print(f"[Doc {i}/{len(docs)}] Processed -> {res.get('scrapped_license')}")
 
     df_docs = pd.DataFrame(processed_docs)
-    if 'license' in df_docs.columns and 'scrapped_license' in df_docs.columns:
-        df_docs.insert(df_docs.columns.get_loc('license') + 1, 'scrapped_license', df_docs.pop('scrapped_license')) # type: ignore
-    
-    output_filename = os.path.join(OUTPUT_DIR, f'license_fix_{source}.xlsx')
+    desired = ["license_fix", "spdx", "conditions_of_access_fix",
+               "license_kind", "license_source", "scrapped_license"]
+    if "license" in df_docs.columns:
+        loc = df_docs.columns.get_loc("license") + 1
+        for col in reversed(desired):
+            if col in df_docs.columns:
+                df_docs.insert(loc, col, df_docs.pop(col))
+
+    suffix = "match" if not scrape else "fix"
+    output_filename = os.path.join(OUTPUT_DIR, f'license_{suffix}_{source}.xlsx')
     df_docs.to_excel(output_filename, index=False)
     print(f"-> License data saved to '{output_filename}'")
 
     print_license_summary(df_docs)
 
 
+def run_license_match_pipeline(num_docs:str="500", source:str="elastic"):
+    """Step 0: classify original_license locally. No HTTP."""
+    return run_license_pipeline(
+        num_docs=num_docs, max_workers=8, source=source,
+        license_filter="unresolved", scrape=False, original_license="present",
+    )
+
+
 def print_license_summary(df_docs):
-    """Report how many of the documents that were missing a license actually got
-    one recovered by the scraper."""
+    """Report how original_license classified, and (if scraped) what HTTP added."""
     print("\n" + "="*60)
     print("LICENSE RECOVERY SUMMARY")
     print("="*60)
 
-    if 'scrapped_license' not in df_docs.columns:
+    print(f"-> Documents in batch           : {len(df_docs)}")
+
+    if "license_kind" in df_docs.columns:
+        kinds = df_docs["license_kind"].fillna("empty").astype(str)
+        licence = df_docs["license_fix"].fillna("").astype(str).str.startswith("lic_")
+        print(f"-> Real licence (lic_*)         : {int(licence.sum())} / {len(df_docs)}"
+              f" ({licence.mean() * 100:.1f}%)")
+        print(f"-> Access only                  : {int((kinds == 'access').sum())}")
+        print(f"-> Repository / copyright       : "
+              f"{int(kinds.isin(['repository', 'copyright']).sum())}")
+        print(f"-> Unmapped / empty             : "
+              f"{int(kinds.isin(['unmapped', 'empty']).sum())}")
+
+        print("\n--- Kind ---")
+        for value, count in kinds.value_counts().items():
+            print(f"     * {value}: {count}")
+
+        if "spdx" in df_docs.columns:
+            spdx = df_docs.loc[licence, "spdx"].fillna("").astype(str)
+            spdx = spdx[spdx != ""]
+            if not spdx.empty:
+                print("\n--- SPDX ---")
+                for value, count in spdx.value_counts().head(12).items():
+                    print(f"     * {value}: {count}")
+
+        sources = df_docs.loc[licence, "license_source"].fillna("").astype(str)
+        if not sources.empty:
+            print("\n--- What recovered a licence ---")
+            for value, count in sources.value_counts().items():
+                print(f"     * {value}: {count}")
+        print("="*60 + "\n")
+        return
+
+    if "scrapped_license" not in df_docs.columns:
         print("-> No scraped license column to report on.")
         print("="*60 + "\n")
         return
 
-    results = df_docs['scrapped_license'].fillna("[unknown, no result]").astype(str)
+    results = df_docs["scrapped_license"].fillna("[unknown, no result]").astype(str)
 
     already_classified = results == "Already classified"
     searched = results[~already_classified]
     # Anything that isn't an "[unknown, ...]" marker is a license we recovered.
-    found = searched[~searched.str.startswith("[unknown")]
+    found = searched[~searched.str.startswith("[unknown") & ~searched.str.startswith("[access")
+                     & ~searched.str.startswith("[repository") & ~searched.str.startswith("[copyright")
+                     & ~searched.str.startswith("[unmapped") & ~searched.str.startswith("[no original")]
 
     total_searched = len(searched)
-    print(f"-> Documents in batch           : {len(df_docs)}")
     print(f"-> Already had a license        : {int(already_classified.sum())}")
     print(f"-> Searched (unresolved group)  : {total_searched}")
 
@@ -104,7 +177,7 @@ def print_license_summary(df_docs):
     for value, count in found.value_counts().items():
         print(f"     * {value}: {count} ({count / total_searched * 100:.1f}%)")
 
-    unknowns = searched[searched.str.startswith("[unknown")]
+    unknowns = searched[~searched.index.isin(found.index)]
     if not unknowns.empty:
         print("\n--- Why the rest failed ---")
         for reason, count in unknowns.value_counts().items():
@@ -262,6 +335,66 @@ def _disambiguate_clustered(authors, enrich_from_dois=True):
     merged = sum(1 for r in clustered if r.get("is_aka") == "Yes")
     print(f"-> {len(clustered) - merged} distinct identities, {merged} records merged into them")
     return clustered
+
+
+def run_doi_pipeline(num_docs: str = "100", max_workers: int = 8, kind: str = "empty_string"):
+    """Backfill `doi` when the field is empty or absent. Elasticsearch only.
+
+    kind: empty_string | absent | unusable | with_landing_page
+          (see build_doi_query). empty_string is the ingest bug; keep it
+          separate from a missing field.
+    """
+    print("\n--- STARTING DOCUMENT DOI PIPELINE ---")
+    print(f"Source: elastic | filter: doi={kind} | requested: {num_docs}")
+
+    docs = fetch_elastic_doi_documents(size=num_docs, kind=kind)
+    if not docs:
+        print("No documents found to process.")
+        return
+
+    for doc in docs:
+        doc["doi_problem"] = classify_doi_problem(doc)
+
+    print(f"Processing {len(docs)} documents concurrently...")
+    processed = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(recover_doi, d): d for d in docs}
+        for i, future in enumerate(concurrent.futures.as_completed(futures), 1):
+            res = future.result()
+            processed.append(res)
+            print(f"[Doc {i}/{len(docs)}] {res.get('doi_source')} -> {res.get('doi_fix') or '—'}")
+
+    df_docs = pd.DataFrame(processed)
+    if "doi" in df_docs.columns and "doi_fix" in df_docs.columns:
+        df_docs.insert(df_docs.columns.get_loc("doi") + 1, "doi_fix", df_docs.pop("doi_fix"))
+        df_docs.insert(df_docs.columns.get_loc("doi_fix") + 1, "doi_source", df_docs.pop("doi_source"))
+
+    output_filename = os.path.join(OUTPUT_DIR, f"doi_fix_elastic.xlsx")
+    df_docs.to_excel(output_filename, index=False)
+    print(f"-> DOI data saved to '{output_filename}'")
+    print_doi_summary(df_docs)
+
+
+def print_doi_summary(df_docs):
+    print("\n" + "=" * 60)
+    print("DOI RECOVERY SUMMARY")
+    print("=" * 60)
+
+    sources = df_docs["doi_source"].fillna("not recovered").astype(str)
+    recovered = df_docs["doi_fix"].fillna("").astype(str).str.startswith("10.")
+    print(f"-> Documents in batch           : {len(df_docs)}")
+    print(f"-> DOIs recovered               : {int(recovered.sum())} / {len(df_docs)}"
+          f" ({recovered.mean() * 100:.1f}%)")
+    print(f"-> Still empty                  : {int((~recovered).sum())}")
+
+    print("\n--- What recovered them ---")
+    for value, count in sources[recovered].value_counts().items():
+        print(f"     * {value}: {count}")
+
+    print("\n--- Why the rest failed ---")
+    for value, count in sources[~recovered].value_counts().items():
+        print(f"     * {value}: {count}")
+    print("=" * 60 + "\n")
 
 
 def run_author_pipeline(api_params=None, source:str="gotriple", task:str="disambiguate", strategy:str="cluster"):

@@ -26,6 +26,7 @@ MAX_MIN_INTERVAL = 30.0      # ceiling for the adaptive backoff
 # Hosts that need their own settings. Everything else uses the defaults above.
 HOST_RULES = {
     "api.crossref.org": {"min_interval": 0.35, "max_concurrent": 2},
+    "api.datacite.org": {"min_interval": 0.35, "max_concurrent": 2},
     "api.openalex.org": {"min_interval": 0.2, "max_concurrent": 2},
     "doi.org": {"min_interval": 0.5, "max_concurrent": 2},
     "pub.orcid.org": {"min_interval": 0.5, "max_concurrent": 2},

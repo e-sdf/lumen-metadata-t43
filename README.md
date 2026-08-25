@@ -1,14 +1,16 @@
 # lumen_metadata_t43
 
-Metadata cleaning for [GoTriple](https://www.gotriple.eu). Two problems, both read
-straight from the production Elasticsearch cluster (or, for smaller runs, the public
-GoTriple REST API):
+Cleaning pipelines for LUMEN T4.3 / [GoTriple](https://www.gotriple.eu). The
+analytical note and ES audit live one directory up; this folder is the
+**repair** code. Problems are read from the production Elasticsearch cluster
+(or, for smaller runs, the public GoTriple REST API):
 
 - **Authors** — repair broken names (an ORCID sitting inside the name field, empty
   names, URLs or bare digits) and decide which profiles in `triple-profiles-prod`
   are the same person.
-- **Licenses** — recover a usable license for the 38.2M documents in
-  `triple-documents-prod` whose license is `undefined`, `other`, or absent.
+- **Licenses** — recover a usable license for documents whose license is
+  `undefined`, `other`, or absent.
+- **DOI** — recover a DOI when the field is empty or missing.
 
 Every run writes an Excel report to [data/output/](data/output/).
 
@@ -18,13 +20,16 @@ Every run writes an Excel report to [data/output/](data/output/).
 main.ipynb              the notebook: strategies, the ES queries actually run, live timings
 run_pipeline.py         interactive CLI - same pipelines, prompt-driven
 src/
-  pipelines.py          run_license_pipeline() / run_author_pipeline() - fetch, fan out, write Excel
-  functions_license.py  license recovery: landing-page scraping, Crossref, OpenAlex, Handle, OAI-PMH
-  functions_name.py     name repair (ORCID lookups, recovery from documents) + cluster_authors()
-  es_helpers.py         Elasticsearch gateway: .env loading, paging, retries, QUERY_LOG
-  rate_limit.py         per-host throttle shared by every worker thread
+  pipelines.py              run_license_pipeline() / run_author_pipeline() / run_doi_pipeline()
+  functions_license.py      license recovery: landing-page scraping, Crossref, OpenAlex, Handle, OAI-PMH
+  functions_license_match.py  match a recovered string to a GoTriple license code
+  functions_doi.py          DOI recovery (parse, provider APIs, OAI, HTML meta, Crossref/DataCite)
+  functions_name.py         name repair (ORCID lookups, recovery from documents) + cluster_authors()
+  es_helpers.py             Elasticsearch gateway: .env loading, paging, retries, QUERY_LOG
+  rate_limit.py             per-host throttle shared by every worker thread
 tests/
-  test_clustering.py    offline fixtures for cluster_authors - no network
+  test_clustering.py        offline fixtures for cluster_authors - no network
+  test_doi.py / test_license_match.py
 data/
   queries/queries.es    scratchpad of raw ES queries (for the VS Code Elastic extension)
   output/               generated reports: license_fix_*.xlsx, authors_*_*.xlsx, ...
