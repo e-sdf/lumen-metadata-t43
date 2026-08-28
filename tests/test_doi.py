@@ -5,6 +5,7 @@
 import sys
 
 from src.functions_doi import (
+    build_doi_query,
     normalise_doi,
     parse_doi_from_record,
     titles_match,
@@ -49,6 +50,19 @@ def main():
         "titles_match rejects unrelated",
         not titles_match("The Rich Man and the Poor Lazarus",
                          "Unrelated chemistry paper"),
+    )
+    failures += check(
+        "empty_string query is doi == \"\"",
+        build_doi_query("empty_string") == {"term": {"doi": ""}},
+    )
+    failures += check(
+        "absent query is field missing, not empty string",
+        build_doi_query("absent")
+        == {"bool": {"must_not": [{"exists": {"field": "doi"}}]}},
+    )
+    failures += check(
+        "empty_string and absent stay separate",
+        build_doi_query("empty_string") != build_doi_query("absent"),
     )
 
     orig_crossref = sys.modules["src.functions_doi"].fetch_crossref_work

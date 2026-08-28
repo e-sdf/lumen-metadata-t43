@@ -81,7 +81,22 @@ def main():
     failures += check("copyright does not fill license_fix",
                       reserved_doc["license_fix"] == "" and reserved_doc["kind"] == "copyright")
 
-    from src.functions_license import process_document
+    from src.functions_license import build_license_query, process_document
+
+    present = build_license_query("unresolved", original_license="present")
+    absent = build_license_query("unresolved", original_license="absent")
+    failures += check(
+        "present query requires a non-empty original_license",
+        "must" in present.get("bool", {}) and present != absent,
+    )
+    failures += check(
+        "absent query is the HTTP remainder (must_not the present clause)",
+        "must_not" in absent.get("bool", {}),
+    )
+    failures += check(
+        "absent and present wrap the same unresolved base",
+        present["bool"]["must"][0] == absent["bool"]["must"][0],
+    )
     local = process_document({
         "license": ["undefined"],
         "original_license": ["https://creativecommons.org/licenses/by/4.0/"],
@@ -100,6 +115,15 @@ def main():
                       access_only["license_fix"] == ""
                       and access_only["conditions_of_access_fix"] == "openAccess"
                       and access_only["license_kind"] == "access")
+
+    no_ol = process_document({
+        "license": ["undefined"],
+        "original_license": [],
+        "main_entity_of_page": ["https://example.invalid/never-hit"],
+    }, scrape=False)
+    failures += check("absent original_license stays empty without HTTP",
+                      no_ol.get("license_fix", "") in ("", None)
+                      and "no original_license" in str(no_ol.get("scrapped_license", "")))
 
     print("\n" + ("all checks passed" if not failures else f"{failures} FAILURES"))
     return 1 if failures else 0
