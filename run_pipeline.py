@@ -57,24 +57,26 @@ def ask_author_task():
     print("    1. Names with an ORCID inside     (almost all recoverable)")
     print("    2. Empty names                    (rarely recoverable)")
     print("    3. URL or bare-digit names        (rarely recoverable)")
-    print("    4. All broken names at once       ")
+    print("    4. Email / placeholder / encoding / punctuation / lifespan")
+    print("    5. All broken names at once       ")
     print("  DISAMBIGUATION")
-    print("    5. Authors matching a name you type")
-    print("    6. The most duplicated name        (picks it automatically)")
+    print("    6. Authors matching a name you type")
+    print("    7. The most duplicated name        (picks it automatically)")
 
-    answer = input("\nEnter your choice (1-6) [default 1]: ").strip() or '1'
+    answer = input("\nEnter your choice (1-7) [default 1]: ").strip() or '1'
 
     tasks = {
         '1': "orcid_names",
         '2': "empty_names",
         '3': "junk_names",
-        '4': "broken_names",
-        '6': "top_author",
+        '4': "repairable_names",
+        '5': "broken_names",
+        '7': "top_author",
     }
     if answer in tasks:
         return tasks[answer], "cluster"
 
-    if answer != '5':
+    if answer != '6':
         print(f"'{answer}' is not one of the options - recovering ORCID-bearing names.")
         return "orcid_names", "cluster"
 
