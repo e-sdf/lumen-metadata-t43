@@ -15,7 +15,8 @@ from src.functions_doi import fetch_elastic_doi_documents, recover_doi, classify
 from src.functions_name import (fetch_gotriple_authors, fetch_elastic_authors, process_author,
                                 resolve_author, cluster_authors, recover_names_from_documents, classify_name_problem,
                                 fetch_top_author_names, fetch_names_from_documents, best_name_form,
-                                resolve_repository_ids, enrich_authors_from_dois)
+                                resolve_repository_ids, enrich_authors_from_dois, repair_malformed_name,
+                                is_bare_numeric_name)
 
 # Paths are anchored to the project root, so a run works from any working directory.
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -24,10 +25,11 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Name-repair tasks: task name -> (selection filter, label for the log).
 NAME_REPAIR_TASKS = {
-    "empty_names":  ("empty",     "empty full names"),
-    "orcid_names":  ("orcid",     "names with an ORCID inside them"),
-    "junk_names":   ("junk",      "names that are a URL or bare digits"),
-    "broken_names": ("malformed", "all broken names (empty, ORCID inside, URLs, numeric)"),
+    "empty_names":      ("empty",      "empty full names"),
+    "orcid_names":      ("orcid",      "names with an ORCID inside them"),
+    "junk_names":       ("junk",       "names that are a URL or bare digits"),
+    "repairable_names": ("repairable", "email, placeholder, encoding, punctuation, lifespan/local id"),
+    "broken_names":     ("malformed",  "all broken names (empty, ORCID inside, URLs, numeric)"),
 }
 
 LICENSE_MATCH_FIELDS = [
@@ -92,6 +94,11 @@ def run_license_pipeline(num_docs:str="1000", max_workers:int=8, source:str="got
                 df_docs.insert(loc, col, df_docs.pop(col))
 
     suffix = "match" if not scrape else "fix"
+    # Keep the historical names for present/any so older notebook cells still
+    # find their Excel. The HTTP remainder (original_license absent) must not
+    # overwrite them.
+    if original_license == "absent":
+        suffix = f"{suffix}_absent"
     output_filename = os.path.join(OUTPUT_DIR, f'license_{suffix}_{source}.xlsx')
     df_docs.to_excel(output_filename, index=False)
     print(f"-> License data saved to '{output_filename}'")
@@ -104,6 +111,15 @@ def run_license_match_pipeline(num_docs:str="500", source:str="elastic"):
     return run_license_pipeline(
         num_docs=num_docs, max_workers=8, source=source,
         license_filter="unresolved", scrape=False, original_license="present",
+    )
+
+
+def run_license_http_absent_pipeline(num_docs:str="100", source:str="elastic",
+                                     max_workers:int=10):
+    """Step 1: scrape when original_license is absent. Small sample only."""
+    return run_license_pipeline(
+        num_docs=num_docs, max_workers=max_workers, source=source,
+        license_filter="unresolved", scrape=True, original_license="absent",
     )
 
 
@@ -200,13 +216,15 @@ def _resolve_in_parallel(authors, label="Resolved"):
 def _recover_names(authors):
     """Fix broken names, whatever is wrong with them.
 
-    Four routes, cheapest first:
-      0. a bare number that is a repository's author id -> not a person at all
-      1. an ORCID sitting inside the name -> ask ORCID for the canonical name
-      2. the documents index -> the name a document records for this author id
-      3. strip the junk (URLs, "orcid" tokens, stray punctuation) off what is left
+    Routes, cheapest first:
+      0. exact placeholders -> drop (not a person)
+      1. a bare number that is a repository's author id -> not a person
+      2. local string repair (email, encoding, punctuation, lifespan/local id)
+      3. an ORCID sitting inside the name -> ask ORCID for the canonical name
+      4. the documents index -> the name a document records for this author id
+      5. strip leftover junk off what is left
 
-    Route 1 and 3 live in resolve_author(); routes 0 and 2 are batched queries.
+    Routes 3 and 5 live in resolve_author(); 1 and 4 are batched queries.
     """
     print(f"Recovering names for {len(authors)} profiles...")
 
@@ -215,11 +233,21 @@ def _recover_names(authors):
     problems = collections.Counter(a["name_problem"] for a in authors)
     print("-> what is wrong with them:", dict(problems.most_common()))
 
-    # Route 0: settle the bare numbers that are repository ids before paying for
+    settled = []
+
+    # Route 0: dummy values are not people and must not be title-cased into a name.
+    placeholders = [a for a in authors if a["name_problem"] == "placeholder"]
+    for author in placeholders:
+        author["name_source"] = "dropped"
+        author["fullname_fix"] = ""
+        author["id_fix"] = None
+        settled.append(author)
+    authors = [a for a in authors if a["name_problem"] != "placeholder"]
+
+    # Route 1: settle the bare numbers that are repository ids before paying for
     # any lookup. There is no name to recover for these - they are not people -
     # so they are answered here and skipped by everything below.
-    settled = []
-    numeric = [a for a in authors if a["name_problem"] == "numeric"]
+    numeric = [a for a in authors if is_bare_numeric_name(a.get("fullname"))]
     if numeric:
         owners = resolve_repository_ids(numeric)
         print(f"-> {len(owners)}/{len(numeric)} numeric names are a repository's own author id, "
@@ -233,8 +261,41 @@ def _recover_names(authors):
                 settled.append(author)
         authors = [a for a in authors if a.get("name_source") != "repository id"]
 
-    # Route 2, batched: only worth it where there is no ORCID to follow.
-    without_orcid = [a for a in authors if a["name_problem"] in ("empty", "numeric", "no letters", "url instead of a name")]
+    # Route 2: deterministic local repair. Skip ORCID API / document lookup when
+    # the string itself yields a person name (or a drop). ORCID leftovers go on.
+    still_need_lookup = []
+    local_done = 0
+    for author in authors:
+        problem = author["name_problem"]
+        if problem in ("institution", "abnormal_case", "single_token", "ok",
+                       "empty", "url", "too_short", "orcid_word", "orcid_code"):
+            still_need_lookup.append(author)
+            continue
+        result = repair_malformed_name(author.get("fullname"))
+        author["id_fix"] = result.get("orcid")
+        if result["action"] == "dropped":
+            author["fullname_fix"] = ""
+            author["name_source"] = "dropped"
+            settled.append(author)
+            local_done += 1
+        elif result["action"] == "cleaned":
+            author["fullname_fix"] = result["repaired"]
+            author["name_source"] = "cleaned in place"
+            settled.append(author)
+            local_done += 1
+        elif result["action"] == "orcid_lookup":
+            if result.get("repaired"):
+                author["fullname"] = result["repaired"]
+            still_need_lookup.append(author)
+        else:
+            still_need_lookup.append(author)
+    if local_done:
+        print(f"-> {local_done} repaired or dropped locally (no HTTP)")
+    authors = still_need_lookup
+
+    # Route 4, batched: only worth it where there is no ORCID to follow.
+    without_orcid = [a for a in authors if a["name_problem"] in ("empty", "url", "too_short")
+                     or is_bare_numeric_name(a.get("fullname"))]
     if without_orcid:
         from_documents = recover_names_from_documents(without_orcid)
         print(f"-> {len(from_documents)}/{len(without_orcid)} recovered from the documents index")
@@ -249,11 +310,11 @@ def _recover_names(authors):
         if author.get("name_source"):
             continue
         fixed = str(author.get("fullname_fix") or "")
-        if author["name_problem"] == "ok":
+        if author["name_problem"] in ("ok", "institution", "abnormal_case", "single_token"):
             author["name_source"] = "unchanged"
         elif (not fixed or fixed in ("No Name Available", "No Name Found")
-                or classify_name_problem(fixed) != "ok"):
-            # A "fix" that is still a bare number or a URL is not a recovery.
+                or classify_name_problem(fixed) not in ("ok", "encoding", "abnormal_case",
+                                                         "single_token", "institution")):
             author["name_source"] = "not recovered"
         elif author.get("id_fix"):
             author["name_source"] = "orcid api"
@@ -264,10 +325,12 @@ def _recover_names(authors):
     for problem in sorted(problems):
         group = [a for a in resolved if a["name_problem"] == problem]
         fixed = [a for a in group if a["name_source"] not in
-                 ("not recovered", "unchanged", "repository id")]
+                 ("not recovered", "unchanged", "repository id", "dropped")]
         ids = [a for a in group if a["name_source"] == "repository id"]
-        # a repository id is not a failed recovery: there was no name to recover
+        dropped = [a for a in group if a["name_source"] == "dropped"]
         note = f"  ({len(ids)} are repository ids, not people)" if ids else ""
+        if dropped:
+            note += f"  ({len(dropped)} dropped)"
         print(f"     * {problem:24} {len(fixed):>4}/{len(group):<4} recovered{note}")
 
     return resolved
@@ -369,7 +432,12 @@ def run_doi_pipeline(num_docs: str = "100", max_workers: int = 8, kind: str = "e
         df_docs.insert(df_docs.columns.get_loc("doi") + 1, "doi_fix", df_docs.pop("doi_fix"))
         df_docs.insert(df_docs.columns.get_loc("doi_fix") + 1, "doi_source", df_docs.pop("doi_source"))
 
-    output_filename = os.path.join(OUTPUT_DIR, f"doi_fix_elastic.xlsx")
+    # empty_string keeps the historical filename; other kinds get their own file
+    # so a second run does not wipe the first.
+    if kind == "empty_string":
+        output_filename = os.path.join(OUTPUT_DIR, "doi_fix_elastic.xlsx")
+    else:
+        output_filename = os.path.join(OUTPUT_DIR, f"doi_fix_{kind}_elastic.xlsx")
     df_docs.to_excel(output_filename, index=False)
     print(f"-> DOI data saved to '{output_filename}'")
     print_doi_summary(df_docs)

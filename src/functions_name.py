@@ -1,11 +1,10 @@
 import difflib
 import re
 import time
+import unicodedata
 import requests
 import pandas as pd
 import threading
-import re
-import requests
 import xml.etree.ElementTree as ET
 
 session = requests.Session()
@@ -39,6 +38,38 @@ EMPTY_NAME_QUERY = {"term": {"fullname.keyword": ""}}
 #   a URL instead of, or beside, a name            1,289
 #   nothing but digits                               513
 ORCID_PATTERN = ".*[0-9]{4}-[0-9]{4}-[0-9]{4}-[0-9X]{4}.*"
+ORCID_RE = re.compile(r"\d{4}-\d{4}-\d{4}-\d{3}[\dxX]", re.I)
+EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+URL_RE = re.compile(r"https?://|www\.", re.I)
+ORCIDWORD_RE = re.compile(r"(?i)\borcid\b")
+PLACEHOLDER_RE = re.compile(
+    r"(?i)^\s*(anonymous|anonyme|anon\.?|unknown|inconnu|n\.?\s*n\.?|s\.?\s*n\.?|"
+    r"sans\s*nom|no\s*name|not\s*available|na|null|none|collectif|collective|"
+    r"various|et\s*al\.?|nn)\s*$"
+)
+INSTITUTION_RE = re.compile(
+    r"(?i)\b(universit|institut|instituto|college|minist|department|faculty|facult|"
+    r"laborator|academ|society|associat|council|committee|foundation|center|"
+    r"centre|centro|GmbH|Ltd|Inc\.?|company|agency|bureau|office|press|presses|"
+    r"editions)"
+)
+HTML_ENTITY_RE = re.compile(r"&(?:#[0-9]+|[A-Za-z][A-Za-z0-9]+);?")
+MOJIBAKE_RE = re.compile(r"\u00c3[\u00a9\u00a8\u00a4\u00a1\u00ab\u00bb]|\ufffd|\u00e2\u20ac")
+# Trailing library-authority lifespan only (`1444-1522` at the end), plus `(177521)`.
+LIFESPAN_RE = re.compile(
+    r"(?:,\s*)?\(?\b(?:1[0-9]{3}|20[0-9]{2})\s*[-–—]\s*(?:1[0-9]{3}|20[0-9]{2})\)?\s*$"
+)
+LOCAL_ID_RE = re.compile(r"\(\s*\d{2,}\s*\)")
+LETTER_RE = re.compile(r"[^\W\d_]", re.UNICODE)
+
+# Codes returned by classify_name_problem, matching note §2.2.3.
+NOTE_NAME_CODES = (
+    "empty", "orcid_word", "orcid_code", "url", "email", "placeholder",
+    "institution", "punctuation", "digits", "too_short", "single_token",
+    "encoding", "abnormal_case", "ok",
+)
+CLASSIFY_ONLY_CODES = ("institution", "abnormal_case", "single_token")
+REPAIRABLE_CODES = ("email", "placeholder", "encoding", "punctuation", "digits", "orcid_code")
 
 # Names carrying an ORCID, in any form: the bare identifier, an orcid.org URL,
 # or the identifier tacked onto a real name. The highest-yield repair case -
@@ -70,39 +101,137 @@ MALFORMED_NAME_QUERY = {
     }
 }
 
+
+def _keyword_regexp(pattern):
+    """Regexp on fullname.keyword with Lucene operators off (`@` is not 'any')."""
+    return {"regexp": {"fullname.keyword": {"value": pattern, "flags": "NONE"}}}
+
+
+EMAIL_NAME_QUERY = _keyword_regexp(".*@.*")
+PLACEHOLDER_NAME_QUERY = {
+    "terms": {
+        "fullname.keyword": [
+            "s.n.", "S.n.", "S.N.", "unknown", "Unknown", "UNKNOWN",
+            "NN", "nn", "N.N.", "n.n.", "anonymous", "Anonymous",
+            "Not Available", "n/a", "N/A", "et al.", "null", "none", "NA",
+        ]
+    }
+}
+PUNCTUATION_NAME_QUERY = _keyword_regexp(".*(;|::|//|#).*")
+ENCODING_NAME_QUERY = {
+    "bool": {
+        "should": [
+            _keyword_regexp(".*" + "\u00a0" + ".*"),
+            _keyword_regexp(".*Ã.*"),
+            _keyword_regexp(".*â€.*"),
+            _keyword_regexp(".*\ufffd.*"),
+        ],
+        "minimum_should_match": 1,
+    }
+}
+# Lifespan / local id only — not every name that contains a digit, and not an ORCID.
+DIGITS_NAME_QUERY = {
+    "bool": {
+        "should": [
+            _keyword_regexp(".*\\([0-9]{2,}\\).*"),
+            _keyword_regexp(".*(1[0-9]{3}|20[0-9]{2})-(1[0-9]{3}|20[0-9]{2}).*"),
+        ],
+        "minimum_should_match": 1,
+        "must_not": [{"regexp": {"fullname.keyword": ORCID_PATTERN}}],
+    }
+}
+
+# Wednesday repairs. Does not replace empty / orcid / junk — those stay §1.1–1.3.
+REPAIRABLE_NAME_QUERY = {
+    "bool": {
+        "should": [
+            EMAIL_NAME_QUERY,
+            PLACEHOLDER_NAME_QUERY,
+            PUNCTUATION_NAME_QUERY,
+            ENCODING_NAME_QUERY,
+            DIGITS_NAME_QUERY,
+        ],
+        "minimum_should_match": 1,
+    }
+}
+
 # Selections the name-repair task can run over.
 NAME_FILTER_QUERIES = {
     "empty": EMPTY_NAME_QUERY,
     "orcid": ORCID_NAME_QUERY,
     "junk": JUNK_NAME_QUERY,
     "malformed": MALFORMED_NAME_QUERY,
+    "repairable": REPAIRABLE_NAME_QUERY,
 }
 
 
+def is_placeholder_name(text):
+    return bool(PLACEHOLDER_RE.match(str(text or "").strip()))
+
+
+def is_bare_numeric_name(text):
+    """All-digit 'name' — a repository author id, not a lifespan in a real name."""
+    return str(text or "").strip().isdigit()
+
+
 def classify_name_problem(fullname):
-    """What is wrong with this name, so the report can separate the cases."""
-    text = str(fullname or "").strip()
+    """Note §2.2.3 code for this name. First match wins.
+
+    ORCID pattern is classified *before* generic digits, so a bare
+    `0000-0002-8447-4734` is `orcid_code` and not `digits`. That order is the
+    repair order; the P0 scan listed `orcid_code` last, so those tables still
+    count a bare ORCID under `digits`. Do not mix the two.
+    """
+    raw = "" if fullname is None or (isinstance(fullname, float) and pd.isna(fullname)) else str(fullname)
+    text = raw.strip()
     if not text:
         return "empty"
 
-    has_orcid = bool(extract_orcid(text))
-    # Strip the ORCID and any URL, then see whether a name was ever there.
-    remainder = re.sub(r'https?://\S+', '', text)
-    remainder = re.sub(r'(?i)\borcid\b\s*(icon)?\s*:?', '', remainder)
-    remainder = re.sub(r'\d{4}-\d{4}-\d{4}-\d{3}[0-9X]', '', remainder)
-    letters = re.findall(r'[^\W\d_]', remainder)
+    flags = set()
+    if ORCIDWORD_RE.search(text):
+        flags.add("orcid_word")
+    if extract_orcid(text):
+        flags.add("orcid_code")
+    if URL_RE.search(text):
+        flags.add("url")
+    if EMAIL_RE.search(text):
+        flags.add("email")
+    if is_placeholder_name(text):
+        flags.add("placeholder")
+    if INSTITUTION_RE.search(text):
+        flags.add("institution")
+    if _has_author_separator(text):
+        flags.add("punctuation")
+    if re.search(r"\d", text):
+        flags.add("digits")
+    letters = LETTER_RE.findall(text)
+    if len(letters) <= 1:
+        flags.add("too_short")
+    alpha = [t for t in re.split(r"[\s,]+", text) if LETTER_RE.search(t)]
+    if len(alpha) == 1 and "institution" not in flags:
+        flags.add("single_token")
+    if "\xa0" in raw or MOJIBAKE_RE.search(raw):
+        flags.add("encoding")
+    if (text.isupper() or text.islower()) and len(letters) > 3:
+        flags.add("abnormal_case")
 
-    if has_orcid:
-        return "orcid only" if len(letters) < 2 else "orcid embedded in name"
-    # "Ardeshir Bazrkar orcid" - the word survived but the identifier did not.
-    if re.search(r'(?i)\borcid\b', text):
-        return "stray orcid word"
-    if text.isdigit():
-        return "numeric"
-    if re.match(r'^https?://', text):
-        return "url instead of a name"
-    if len(letters) < 2:
-        return "no letters"
+    for code in (
+        "empty",
+        "orcid_word",
+        "orcid_code",  # before digits — unlike the P0 first-match list
+        "url",
+        "email",
+        "placeholder",
+        "institution",
+        "punctuation",
+        "digits",
+        "too_short",
+        "single_token",
+        "encoding",
+        "abnormal_case",
+    ):
+        if code in flags:
+            return code
     return "ok"
 
 def extract_orcid(text):
@@ -112,6 +241,102 @@ def extract_orcid(text):
     if match := re.search(r'(\d{3,4})-(\d{4})-(\d{4})-(\d{3}[0-9X])', clean_text):
         return f"{match.group(1).zfill(4)}-{match.group(2).zfill(4)}-{match.group(3).zfill(4)}-{match.group(4)}"
     return None
+
+
+def _collapse_spaces(text):
+    return re.sub(r"\s+", " ", text).strip(" -,;:/#")
+
+
+def _has_author_separator(text):
+    """`;` `::` `//` `#` as co-author glue, ignoring HTML entities."""
+    stripped = HTML_ENTITY_RE.sub(" ", text)
+    return bool(re.search(r"[;#]|::|//", stripped))
+
+
+def _first_person_token(text):
+    """Split on `;` `::` `//` `#` and keep the first person-like piece.
+
+    Cannot invent co-authors from a concatenated string — only one token is kept.
+    HTML entities (`&Aacute;`, `&#7884;`) are stashed so `;` / `#` inside them
+    are not treated as author separators.
+    """
+    stashed = []
+
+    def _stash(match):
+        stashed.append(match.group(0))
+        return f"\ue000{len(stashed) - 1}\ue001"
+
+    def _restore(piece):
+        return re.sub(r"\ue000(\d+)\ue001", lambda m: stashed[int(m.group(1))], piece)
+
+    protected = HTML_ENTITY_RE.sub(_stash, text)
+    parts = re.split(r"\s*(?:;|::|//|(?<!&)#)\s*", protected)
+    parts = [_restore(_collapse_spaces(p)) for p in parts if _collapse_spaces(p)]
+    for part in parts:
+        if is_placeholder_name(part) or EMAIL_RE.search(part) or URL_RE.search(part):
+            continue
+        if looks_like_a_name(part):
+            return part
+    return parts[0] if parts else ""
+
+
+def _strip_name_noise(text, orcid=None):
+    """Deterministic string cleaners. Does not call the ORCID API."""
+    cleaned = unicodedata.normalize("NFC", str(text))
+    cleaned = cleaned.replace("\xa0", " ")
+    if orcid:
+        cleaned = cleaned.replace(orcid, "")
+        cleaned = cleaned.replace(orcid.lower(), "")
+    cleaned = re.sub(r"https?://[^\s,;]*", "", cleaned)
+    cleaned = re.sub(r"(?i)\bwww\.[^\s,;]*", "", cleaned)
+    cleaned = EMAIL_RE.sub("", cleaned)
+    cleaned = re.sub(r"(?i)\borcid\b\s*(id|icon)?\s*:?", "", cleaned)
+    # ORCID pattern last among id-like tokens, so a lifespan is not treated as one.
+    cleaned = re.sub(r"\d{4}-\d{4}-\d{4}-\d{3}[0-9Xx]", "", cleaned)
+    cleaned = LOCAL_ID_RE.sub("", cleaned)
+    cleaned = LIFESPAN_RE.sub("", cleaned)
+    cleaned = _first_person_token(cleaned)
+    return _collapse_spaces(cleaned)
+
+
+def repair_malformed_name(text, orcid_hint=None):
+    """Local repair for one fullname. Offline — no HTTP.
+
+    Returns dict: problem, repaired, action, orcid.
+    action: cleaned | dropped | orcid_lookup | classify_only | unchanged | empty
+    """
+    raw = "" if text is None or (isinstance(text, float) and pd.isna(text)) else str(text)
+    problem = classify_name_problem(raw)
+    orcid = orcid_hint or extract_orcid(raw)
+
+    if problem == "empty":
+        return {"problem": problem, "repaired": None, "action": "empty", "orcid": orcid}
+    if problem in CLASSIFY_ONLY_CODES:
+        return {"problem": problem, "repaired": raw.strip(), "action": "classify_only", "orcid": orcid}
+    if problem == "placeholder" or is_placeholder_name(raw):
+        return {"problem": problem, "repaired": None, "action": "dropped", "orcid": orcid}
+    if is_bare_numeric_name(raw):
+        return {"problem": "digits", "repaired": raw.strip(), "action": "classify_only", "orcid": orcid}
+
+    cleaned = _strip_name_noise(raw, orcid=orcid)
+    if is_placeholder_name(cleaned):
+        cleaned = ""
+
+    if orcid and not cleaned:
+        return {"problem": problem, "repaired": None, "action": "orcid_lookup", "orcid": orcid}
+    if not cleaned:
+        return {"problem": problem, "repaired": None, "action": "dropped", "orcid": orcid}
+    if orcid:
+        return {"problem": problem, "repaired": cleaned, "action": "orcid_lookup", "orcid": orcid}
+
+    changed = cleaned != raw.strip()
+    return {
+        "problem": problem,
+        "repaired": cleaned,
+        "action": "cleaned" if changed else ("unchanged" if problem == "ok" else "partial"),
+        "orcid": orcid,
+    }
+
 
 def _author_in_source_record(known_name, people):
     """The one author of a source record this profile can be, or None.
@@ -222,13 +447,8 @@ def enrich_author_data_from_documents(docs, known_name=""):
 def clean_messy_name(text, orcid):
     if not text or pd.isna(text):
         return "No Name Available"
-    clean_text = str(text)
-    if orcid:
-        clean_text = clean_text.replace(orcid, "")
-    clean_text = re.sub(r'https?://[^\s,]*', '', clean_text)
-    clean_text = re.sub(r'(?i)\borcid\b\s*(id)?\s*:?', '', clean_text)
-    clean_text = re.sub(r'[|;:#/]+', ' ', clean_text).strip(" -,")
-    return clean_text if clean_text else "No Name Found"
+    repaired = repair_malformed_name(text, orcid_hint=orcid).get("repaired")
+    return repaired if repaired else "No Name Found"
 
 def fetch_orcid_name(orcid_id, original_text):
     if not orcid_id:
@@ -348,6 +568,62 @@ def count_elastic_authors(name_filter=None, query=None, exact_name=None, index=P
 
     return es_search({"size": 0, "track_total_hits": True, "query": body_query},
                      index=index, timeout=180)["hits"]["total"]["value"]
+
+
+# Nested type: `exists` on `author` is true for every document. An empty or
+# missing nested array is `must_not` a nested `match_all` on `path: author`.
+NO_AUTHOR_QUERY = {
+    "bool": {
+        "must_not": [
+            {"nested": {"path": "author", "query": {"match_all": {}}}},
+        ]
+    }
+}
+
+
+def count_documents_without_author(index=DOCUMENTS_INDEX):
+    """Documents whose nested `author` is missing or empty. Live index — not S0–S3."""
+    from src.es_helpers import es_search
+
+    return es_search(
+        {"size": 0, "track_total_hits": True, "query": NO_AUTHOR_QUERY},
+        index=index, timeout=180,
+    )["hits"]["total"]["value"]
+
+
+def no_author_by_provider(size=15, index=DOCUMENTS_INDEX):
+    """Top `size` providers by document volume, with no-author count and rate.
+
+    A document with several `provider` values is counted in each bucket (same
+    as the other provider tables). Label the run live; do not mix with S0–S3.
+    """
+    from src.es_helpers import es_search
+
+    body = {
+        "size": 0,
+        "track_total_hits": True,
+        "aggs": {
+            "by_provider": {
+                "terms": {"field": "provider", "size": size},
+                "aggs": {
+                    "no_author": {"filter": NO_AUTHOR_QUERY},
+                },
+            }
+        },
+    }
+    resp = es_search(body, index=index, timeout=180)
+    corpus = resp["hits"]["total"]["value"]
+    rows = []
+    for bucket in resp["aggregations"]["by_provider"]["buckets"]:
+        docs = bucket["doc_count"]
+        n = bucket["no_author"]["doc_count"]
+        rows.append({
+            "provider": bucket["key"],
+            "documents": docs,
+            "no_author": n,
+            "rate": (n / docs) if docs else 0.0,
+        })
+    return corpus, count_documents_without_author(index=index), rows
 
 
 def fetch_top_author_names(size=20, min_profiles=2, index=PROFILES_INDEX):
