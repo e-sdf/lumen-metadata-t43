@@ -13,11 +13,12 @@ import sys
 from src.functions_name import cluster_authors, name_is_informative
 
 
-def profile(pid, name, topics=(), docs=(), orgs=(), orcid=None, dois=(), co_authors=()):
+def profile(pid, name, topics=(), docs=(), orgs=(), orcid=None, dois=(), co_authors=(),
+            crowded=()):
     return {
         "id": pid, "fullname": name, "_resolved_name": name, "id_fix": orcid,
         "topic": list(topics), "author_of": list(docs), "current_organization": list(orgs),
-        "doi": list(dois), "co_authors": list(co_authors),
+        "doi": list(dois), "co_authors": list(co_authors), "crowded_documents": list(crowded),
     }
 
 
@@ -108,6 +109,25 @@ FIXTURES = [
          profile("b", "João Paulo Pimenta", topics=["hist"], docs=["d2"]),
          profile("c", "Pimenta, João Paulo", topics=["hist"], docs=["d3"])],
         {frozenset({"a", "b", "c"})},
+    ),
+    (
+        # The pairwise rule refuses a-b on its own, but union-find used to chain
+        # them anyway through the ORCID-less c. On 500 "Wang, Y." profiles that
+        # built one cluster of 130 records holding 18 distinct ORCIDs.
+        "two ORCIDs never share a cluster, however long the chain",
+        [profile("a", "Wang, Y.", docs=["p1"], orcid="0000-0002-1825-0097"),
+         profile("c", "Wang, Y.", docs=["p1", "p2"]),
+         profile("b", "Wang, Y.", docs=["p2"], orcid="0000-0003-1111-2222")],
+        {frozenset({"a", "c"}), frozenset({"b"})},
+    ),
+    (
+        # Twenty different Wangs are on a CMS paper, so "both are on it" cannot
+        # say which of them either profile is - the same reason CO_AUTHOR_LIMIT
+        # drops those papers from the co-author evidence.
+        "a paper with a cast of hundreds is not a shared document",
+        [profile("a", "Wang, Y.", docs=["mega"], crowded=["mega"]),
+         profile("b", "Wang, Y.", docs=["mega"], crowded=["mega"])],
+        {frozenset({"a"}), frozenset({"b"})},
     ),
 ]
 

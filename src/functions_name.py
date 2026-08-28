@@ -230,6 +230,161 @@ def clean_messy_name(text, orcid):
     clean_text = re.sub(r'[|;:#/]+', ' ', clean_text).strip(" -,")
     return clean_text if clean_text else "No Name Found"
 
+# ==========================================================================
+# MALFORMED FULL NAMES - repair for the kinds beyond empty/ORCID/URL/digits
+# ==========================================================================
+# Only the first is a repair, but the rest are answers too: a value that is not
+# a person cannot be turned into one, and saying so is worth more than writing a
+# plausible-looking name over it. Every outcome is a decision, none is a shrug.
+FIXED = "fixed"                    # changed, and what came out is a usable name
+ALREADY_OK = "already usable"      # nothing to repair
+SEVERAL = "several people"         # one field holding a whole author list
+NOT_A_PERSON = "not a person"      # a placeholder, or an organisation
+UNFIXABLE = "cannot be fixed"      # too little left, or a character lost for good
+
+MALFORMED_OUTCOMES = [FIXED, ALREADY_OK, SEVERAL, NOT_A_PERSON, UNFIXABLE]
+
+# Exact values that stand in for a missing name. Matched case-insensitively on
+# the whole stripped value, never as a substring - "Unknown" is a placeholder,
+# "Unknown, J." is somebody whose surname was lost.
+PLACEHOLDER_VALUES = {
+    "", "-", "--", "---", ".", "..", "...", "?", "??", "n/a", "n.a.", "na", "nn", "n.n.",
+    "s.n.", "s. n.", "sine nomine", "unknown", "unknown author", "not available",
+    "no name available", "no name found", "anonymous", "anon", "anonyme", "anónimo",
+    "author", "authors", "autor", "et al.", "et al", "various", "various authors",
+    "springerlink", "protocol", "null", "none", "undefined",
+}
+
+# A word that makes the value an organisation rather than a person. Kept to
+# unambiguous ones: "Institute" is never a surname, "Center" is not either, but
+# "Bank" and "Press" are, so they are left out.
+INSTITUTION_WORDS = {
+    "university", "universite", "universität", "universidad", "universidade", "università",
+    "universiteit", "uniwersytet", "institute", "institut", "instituto", "istituto",
+    "college", "school", "faculty", "faculté", "akademie", "academy", "académie",
+    "laboratory", "laboratoire", "observatory", "observatoire", "museum", "musée",
+    "ministry", "ministère", "department", "departamento", "consortium", "collaboration",
+    "association", "foundation", "fondation", "fundación", "society", "gmbh", "inc.",
+    "ltd", "llc", "s.a.", "corporation", "company", "commission", "committee", "council",
+    "agency", "organisation", "organization", "centre", "center", "centro", "hospital",
+    "clinic", "cnrs", "inserm", "unesco", "who",
+}
+
+# Mojibake: UTF-8 bytes that were read as cp1252 once, so "é" became "Ã©". The
+# round-trip only reverses cleanly when that is really what happened, which is
+# what makes it safe to attempt on every value.
+MOJIBAKE_MARKERS = ("Ã", "â€", "â‚¬", "Â", "Ð", "ð", "�")
+
+
+def fix_encoding(text):
+    """Undo a mojibake round-trip and normalise invisible characters.
+
+    Returns the text unchanged when the repair does not apply, so it is safe to
+    run over every name rather than only the ones that look broken.
+    """
+    fixed = str(text)
+    for _ in range(3):  # doubly-encoded values need more than one pass
+        if not any(marker in fixed for marker in MOJIBAKE_MARKERS):
+            break
+        try:
+            candidate = fixed.encode("cp1252", errors="strict").decode("utf-8", errors="strict")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            break
+        if candidate == fixed:
+            break
+        fixed = candidate
+
+    fixed = fixed.replace(" ", " ").replace("​", "").replace("﻿", "")
+    # U+FFFD is a character that was lost in transit. It is deliberately NOT
+    # deleted here: dropping it turns "Löve" into "Lve", which is a wrong
+    # name rather than a broken one. repair_malformed_name() refuses instead.
+    fixed = "".join(character for character in fixed
+                    if character.isprintable() or character.isspace())
+    return re.sub(r"\s+", " ", fixed).strip()
+
+
+def fix_casing(text):
+    """Title-case a name that arrived in one case, and leave every other alone.
+
+    `str.title()` is wrong for names - it produces "Mcnally" and "O'brien" - so
+    the internal capital after Mc/Mac/O' is put back, and particles that belong
+    in lower case stay there.
+    """
+    letters = [character for character in text if character.isalpha()]
+    if len(letters) <= 3 or not (text.isupper() or text.islower()):
+        return text
+
+    PARTICLES = {"de", "da", "do", "dos", "das", "del", "della", "di", "van", "von", "der",
+                 "den", "ter", "le", "la", "el", "bin", "ibn", "y", "e"}
+    words = []
+    for position, word in enumerate(text.lower().split()):
+        if position and word.strip(".,") in PARTICLES:
+            words.append(word)
+            continue
+        word = word[:1].upper() + word[1:]
+        word = re.sub(r"\b(Mc|Mac|O')([a-z])", lambda m: m.group(1) + m.group(2).upper(), word)
+        word = re.sub(r"(-)([a-z])", lambda m: m.group(1) + m.group(2).upper(), word)
+        words.append(word)
+    return " ".join(words)
+
+
+def repair_malformed_name(text):
+    """Best name this value can yield, and what happened to it.
+
+    Returns (name, outcome). The steps run in the order the damage accumulates:
+    the encoding is repaired first so everything after it sees real characters,
+    then whatever is attached to the name is stripped, then what is left is
+    judged - because a value can only be called a placeholder or an institution
+    once the URL and the email have gone.
+    """
+    original = "" if text is None or (isinstance(text, float) and pd.isna(text)) else str(text)
+    working = fix_encoding(original)
+
+    if original.strip().lower() in PLACEHOLDER_VALUES:
+        return "", NOT_A_PERSON
+
+    # Attachments: an identifier or a contact detail sitting beside the name.
+    working = re.sub(r"https?://\S+|www\.\S+", " ", working)
+    working = re.sub(r"\S*@\S+", " ", working)
+    working = re.sub(r"\d{4}-\d{4}-\d{4}-\d{3}[\dX]", " ", working)
+    working = re.sub(r"(?i)\borcid\b\s*(icon|id)?\s*:?", " ", working)
+    # Digits that are not part of a name: lifespans, record ids, list positions.
+    working = re.sub(r"\(\s*\d[\d\s.\-]*\)", " ", working)        # "Rui Sun (177521)"
+    working = re.sub(r"\b\d{3,4}\s*-\s*\d{3,4}\b", " ", working)  # "1444-1522"
+    working = re.sub(r"\d+", " ", working)
+
+    # A whole author list in one field is not a name to repair. Splitting it into
+    # profiles is a different job - one record has to become several - so it is
+    # reported rather than guessed at.
+    people = [part for part in re.split(r"\s*(?:;|::|\|)\s*", working)
+              if len(re.findall(r"[^\W\d_]", part)) >= 2]
+    if len(people) > 1:
+        return _tidy(" ; ".join(_tidy(part) for part in people)), SEVERAL
+
+    working = _tidy(re.sub(r"[|;#/\\<>\[\]{}*]+|::|,{2,}", " ", working))
+
+    if working.lower() in PLACEHOLDER_VALUES:
+        return "", NOT_A_PERSON
+    if {word.strip(".,()").lower() for word in working.split()} & INSTITUTION_WORDS:
+        return "", NOT_A_PERSON
+    if "�" in working:
+        return "", UNFIXABLE      # a letter was lost in transit; any guess is invention
+    if len(re.findall(r"[^\W\d_]", working)) < 2:
+        return "", UNFIXABLE
+
+    repaired = fix_casing(working)
+    return repaired, (FIXED if repaired != original.strip() else ALREADY_OK)
+
+
+def _tidy(text):
+    """Collapse whitespace and drop stranded punctuation - but never the full stop
+    that ends an initial, so "Wang, Y." does not come back as "Wang, Y"."""
+    text = re.sub(r"\s+", " ", str(text))
+    text = re.sub(r"\.{2,}", ".", text)
+    text = text.strip(" ,-–—:'\"").lstrip(". ")
+    return text.strip(" ,-–—:'\"")
+
+
 def fetch_orcid_name(orcid_id, original_text):
     if not orcid_id:
         return clean_messy_name(original_text, None)
@@ -796,6 +951,13 @@ def enrich_authors_from_dois(records, max_workers=8):
         record["co_authors"] = sorted({
             key for entry in found if 0 < len(entry.get("authors", [])) <= CO_AUTHOR_LIMIT
             for key in co_author_keys(trusted_name(record), entry["authors"])})
+        # The same papers, named the way clustering keys its `documents` set, so it
+        # can subtract them: being on one is not evidence of being the same person.
+        record["crowded_documents"] = sorted(
+            {str(document) for document, entry in zip(docs, found)
+             if len(entry.get("authors", [])) > CO_AUTHOR_LIMIT}
+            | {f"doi:{doi}" for entry in found if len(entry.get("authors", [])) > CO_AUTHOR_LIMIT
+               for doi in entry.get("doi", [])})
 
     distinct = sorted({doi for record in records for doi in record["doi"]})
     summary = {"documents": len(references),
@@ -866,13 +1028,27 @@ def cluster_authors(records):
             # one paper is harvested from several repositories and lands under a
             # different GoTriple id each time, so co-authors on it can look
             # unrelated until the DOI puts the copies back together.
-            "documents": {str(d) for d in docs_list}
-                         | {f"doi:{d}" for d in (record.get("doi") or [])},
+            #
+            # Papers with a cast of hundreds are dropped, for the same reason
+            # CO_AUTHOR_LIMIT drops them on the co-author side: a CMS paper lists
+            # twenty different Wangs, so "both are on it" says nothing about which
+            # of them either profile is.
+            "documents": ({str(d) for d in docs_list}
+                          | {f"doi:{d}" for d in (record.get("doi") or [])})
+                         - set(record.get("crowded_documents") or []),
             "co_authors": set(record.get("co_authors") or []),
             "informative": name_is_informative(trusted_name(record)),
         })
 
     parent = list(range(len(contexts)))
+    # The ORCID a whole component carries, keyed by its root. "Two different
+    # ORCIDs are two different people" has to hold for the *cluster*, not just for
+    # the pair being looked at: refusing to join A and B directly achieves nothing
+    # if A joins an ORCID-less C on a shared paper and C then joins B. Measured on
+    # 500 "Wang, Y." profiles, that chain built one cluster of 130 records holding
+    # 18 distinct ORCIDs.
+    component_orcid = {index: context["orcid"] for index, context in enumerate(contexts)
+                       if context["orcid"]}
 
     def find(i):
         while parent[i] != i:
@@ -882,8 +1058,16 @@ def cluster_authors(records):
 
     def union(i, j):
         ri, rj = find(i), find(j)
-        if ri != rj:
-            parent[max(ri, rj)] = min(ri, rj)
+        if ri == rj:
+            return
+        left, right = component_orcid.get(ri), component_orcid.get(rj)
+        if left and right and left != right:
+            return  # the merge would put two people in one identity
+        root, absorbed = min(ri, rj), max(ri, rj)
+        parent[absorbed] = root
+        if left or right:
+            component_orcid[root] = left or right
+        component_orcid.pop(absorbed, None)
 
     for i in range(len(contexts)):
         for j in range(i + 1, len(contexts)):
